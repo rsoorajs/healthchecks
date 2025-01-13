@@ -1,16 +1,6 @@
 $(function () {
-    var BIG_LABEL = 1;
-    var SMALL_LABEL = 2;
-    var PIP = 0;
-    var NO_PIP = -1;
-
-    var slider = document.getElementById("log-slider");
-    var smin = parseInt(slider.dataset.min);
-    var smax = parseInt(slider.dataset.max);
-    var pixelsPerSecond = slider.clientWidth / (smax - smin);
-    var pixelsPerHour = pixelsPerSecond * 3600;
-    var pixelsPerDay = pixelsPerHour * 24;
-    var dayGap = Math.round(0.5 + 80 / pixelsPerDay);
+    var activeRequest = null;
+    var slider = document.getElementById("end");
 
     // Look up the active tz switch to determine the initial display timezone:
     var dateFormat = $(".active", "#format-switcher").data("format");
@@ -20,104 +10,126 @@ $(function () {
         return dt;
     }
 
-    function filterPips(value, type) {
-        var m = fromUnix(value);
-        if (m.minute() != 0)
-            return NO_PIP;
-
-        // Date labels on every day
-        if (pixelsPerDay > 60 && m.hour() == 0)
-            return BIG_LABEL;
-
-        // Date labels every "dayGap" days
-        if (m.hour() == 0 && m.dayOfYear() % dayGap == 0)
-            return BIG_LABEL;
-
-        // Hour labels on every hour:
-        if (pixelsPerHour > 40)
-            return SMALL_LABEL;
-
-        // Hour labels every 3 hours:
-        if (pixelsPerHour > 15 && m.hour() % 3 == 0)
-            return SMALL_LABEL;
-
-        // Hour labels every 6 hours:
-        if (pixelsPerHour > 5 && m.hour() % 6 == 0)
-            return SMALL_LABEL;
-
-        // Pip on every hour
-        if (pixelsPerHour > 5)
-            return PIP;
-
-        // Pip on every day
-        if (pixelsPerDay > 10 && m.hour() == 0)
-            return PIP;
-
-        return NO_PIP;
-    }
-
-    function fmt(ts) {
-        var pipType = filterPips(ts);
-        return fromUnix(ts).format(pipType == 2 ? "HH:mm" : "MMM D");
-    }
-
-    noUiSlider.create(slider, {
-        start: [parseInt(slider.dataset.start), parseInt(slider.dataset.end)],
-        range: {'min': smin, 'max': smax},
-        connect: true,
-        step: 3600,
-        pips: {
-            mode: "steps",
-            density: 3,
-            filter: filterPips,
-            format: {
-                to: fmt,
-                from: function() {}
-            }
-        }
-    });
-
     function updateSliderPreview() {
-        var values = slider.noUiSlider.get();
-        $("#slider-from-formatted").text(fromUnix(values[0]).format("MMMM D, HH:mm"));
-        $("#slider-to-formatted").text(fromUnix(values[1]).format("MMMM D, HH:mm"));
+        var toFormatted = "now, live updates";
+        if (slider.value != slider.max) {
+            toFormatted = fromUnix(slider.value).format("MMM D, HH:mm");
+        }
+        $("#end-formatted").html(toFormatted);
     }
 
-    updateSliderPreview();
-    slider.noUiSlider.on("slide", updateSliderPreview);
+    function formatDateSpans() {
+        $("span[data-dt]").each(function(i, el) {
+            el.innerText = fromUnix(el.dataset.dt).format(el.dataset.fmt);
+        });
+    }
 
-    slider.noUiSlider.on("change", function(a, b, value) {
-        $("#seek-start").val(Math.round(value[0]));
-        $("#seek-end").val(Math.round(value[1]));
-        $("#seek-form").submit();
-    });
+    function updateNumHits() {
+        $("#num-hits").text($("#log tr").length);
+    }
 
-    $("#log tr.ok").on("click", function() {
+    function applyFilters() {
+        var url = document.getElementById("log").dataset.refreshUrl;
+        $("#end").attr("disabled", slider.value == slider.max);
+        var qs = $("#filters").serialize();
+        $("#end").attr("disabled", false);
+
+        if (activeRequest) {
+            // Abort the previous in-flight request so we don't display stale
+            // data later
+            activeRequest.abort();
+        }
+        activeRequest = $.ajax({
+            url: url + "?" + qs,
+            timeout: 2000,
+            success: function(data, textStatus, xhr) {
+                activeRequest = null;
+                lastUpdated = xhr.getResponseHeader("X-Last-Event-Timestamp");
+                var tbody = document.createElement("tbody");
+                tbody.innerHTML = data;
+                switchDateFormat(dateFormat, tbody.querySelectorAll("tr"));
+                $("#log").empty().append(tbody);
+                updateNumHits();
+            }
+        });
+    }
+
+    $("#end").on("input", updateSliderPreview);
+    $("#end").on("change", applyFilters);
+    $("#filters input:checkbox").on("change", applyFilters);
+
+    $("#log").on("click", "tr.ok", function() {
         var n = $("td", this).first().text();
         var tmpl = $("#log").data("url").slice(0, -2);
         loadPingDetails(tmpl + n + "/");
         return false;
     });
 
-    function switchDateFormat(format) {
+    function switchDateFormat(format, rows) {
         dateFormat = format;
-        slider.noUiSlider.updateOptions({}, true);
+        var currentYear = moment().year();
         updateSliderPreview();
 
-        document.querySelectorAll("#log tr").forEach(function(row) {
+        rows.forEach(function(row) {
             var dt = fromUnix(row.dataset.dt);
-            row.children[1].textContent = dt.format("MMM D");
+            var dtFormat = "MMM D";
+            if (dt.year() != currentYear) {
+                dtFormat = "MMM D, YYYY";
+            }
+            
+            row.children[1].textContent = dt.format(dtFormat);
             row.children[2].textContent = dt.format("HH:mm");
         })
     }
 
     $("#format-switcher").click(function(ev) {
         var format = ev.target.dataset.format;
-        switchDateFormat(format);
+        switchDateFormat(format, document.querySelectorAll("#log tr"));
+        formatDateSpans();
     });
 
-    switchDateFormat(dateFormat);
+    switchDateFormat(dateFormat, document.querySelectorAll("#log tr"));
+    formatDateSpans();
     // The table is initially hidden to avoid flickering as we convert dates.
     // Once it's ready, set it to visible:
     $("#log").css("visibility", "visible");
+
+    var lastUpdated = document.getElementById("last-event-timestamp").textContent;
+    function fetchNewEvents() {
+        // Do not fetch updates if the slider is not set to "now"
+        // or there's an AJAX request in flight
+        if (slider.value != slider.max || activeRequest) {
+            return;
+        }
+
+        var url = document.getElementById("log").dataset.refreshUrl;
+        var qs = $("#filters").serialize();
+
+        if (lastUpdated) {
+            qs += "&u=" + lastUpdated;
+        }
+
+        activeRequest = $.ajax({
+            url: url + "?" + qs,
+            timeout: 2000,
+            success: function(data, textStatus, xhr) {
+                activeRequest = null;
+                if (!data)
+                    return;
+
+                lastUpdated = xhr.getResponseHeader("X-Last-Event-Timestamp");
+                var tbody = document.createElement("tbody");
+                tbody.setAttribute("class", "new");
+                tbody.innerHTML = data;
+                switchDateFormat(dateFormat, tbody.querySelectorAll("tr"));
+                document.getElementById("log").prepend(tbody);
+                updateNumHits();
+            },
+            error: function(data, textStatus, xhr) {
+                activeRequest = null;
+            }
+        });
+    }
+
+    adaptiveSetInterval(fetchNewEvents, false);
 });

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 import time
-import uuid
 from datetime import timedelta as td
 from secrets import token_urlsafe
 from urllib.parse import urlparse
+from uuid import UUID, uuid4
 
 import pyotp
 import segno
@@ -19,7 +20,12 @@ from django.contrib.auth.models import User
 from django.core.signing import BadSignature, SignatureExpired, TimestampSigner
 from django.db import transaction
 from django.db.models.functions import Lower
-from django.http import HttpResponse, HttpResponseBadRequest, HttpResponseForbidden
+from django.http import (
+    HttpRequest,
+    HttpResponse,
+    HttpResponseBadRequest,
+    HttpResponseForbidden,
+)
 from django.middleware import csrf
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import Resolver404, resolve, reverse
@@ -30,11 +36,14 @@ from django.views.decorators.http import require_POST
 
 from hc.accounts import forms
 from hc.accounts.decorators import require_sudo_mode
+from hc.accounts.http import AuthenticatedHttpRequest
 from hc.accounts.models import Credential, Member, Profile, Project
 from hc.api.models import Channel, Check, TokenBucket
 from hc.lib.tz import all_timezones
 from hc.lib.webauthn import CreateHelper, GetHelper
 from hc.payments.models import Subscription
+
+logger = logging.getLogger(__name__)
 
 POST_LOGIN_ROUTES = (
     "hc-checks",
@@ -49,7 +58,7 @@ POST_LOGIN_ROUTES = (
 )
 
 
-def _allow_redirect(redirect_url):
+def _allow_redirect(redirect_url: str | None) -> bool:
     if not redirect_url:
         return False
 
@@ -66,8 +75,8 @@ def _allow_redirect(redirect_url):
     return match.url_name in POST_LOGIN_ROUTES
 
 
-def _make_user(email, tz=None, with_project=True):
-    username = str(uuid.uuid4())[:30]
+def _make_user(email: str, tz: str | None = None, with_project: bool = True) -> User:
+    username = str(uuid4())[:30]
     user = User(username=username, email=email)
     user.set_unusable_password()
     user.save()
@@ -100,21 +109,22 @@ def _make_user(email, tz=None, with_project=True):
     return user
 
 
-def _redirect_after_login(request):
+def _redirect_after_login(request: HttpRequest) -> HttpResponse:
     """Redirect to the URL indicated in ?next= query parameter."""
 
     redirect_url = request.GET.get("next")
-    if _allow_redirect(redirect_url):
+    if redirect_url and _allow_redirect(redirect_url):
         return redirect(redirect_url)
 
+    assert isinstance(request.user, User)
     if request.user.project_set.count() == 1:
-        project = request.user.project_set.first()
+        project = request.user.project_set.get()
         return redirect("hc-checks", project.code)
 
     return redirect("hc-index")
 
 
-def _check_2fa(request, user):
+def _check_2fa(request: HttpRequest, user: User) -> HttpResponse:
     have_keys = user.credentials.exists()
     profile = Profile.objects.for_user(user)
     if have_keys or profile.totp:
@@ -140,14 +150,14 @@ def _check_2fa(request, user):
     return _redirect_after_login(request)
 
 
-def _new_key(nbytes=24):
+def _new_key(nbytes: int = 24) -> str:
     while True:
         candidate = token_urlsafe(nbytes)
         if candidate[0] not in "-_" and candidate[-1] not in "-_":
             return candidate
 
 
-def _set_autologin_cookie(response):
+def _set_autologin_cookie(response: HttpResponse) -> None:
     # check_token looks for this cookie to decide if
     # it needs to do the extra POST step.
     response.set_cookie(
@@ -161,14 +171,14 @@ def _set_autologin_cookie(response):
 
 
 @sensitive_post_parameters()
-def login(request):
+def login(request: HttpRequest) -> HttpResponse:
     form = forms.PasswordLoginForm()
     magic_form = forms.EmailLoginForm()
-
     if request.method == "POST":
         if request.POST.get("action") == "login":
             form = forms.PasswordLoginForm(request.POST)
             if form.is_valid():
+                assert isinstance(form.user, User)
                 return _check_2fa(request, form.user)
 
         else:
@@ -197,17 +207,19 @@ def login(request):
         "bad_link": bad_link,
         "registration_open": settings.REGISTRATION_OPEN,
         "support_email": settings.SUPPORT_EMAIL,
+        "account_closed": "account-closed" in request.GET,
+        "use_magic_form": bool(settings.EMAIL_HOST),
     }
     return render(request, "accounts/login.html", ctx)
 
 
 @require_POST
-def logout(request):
+def logout(request: HttpRequest) -> HttpResponse:
     auth_logout(request)
     return redirect("hc-index")
 
 
-def signup_csrf(request):
+def signup_csrf(request: HttpRequest) -> HttpResponse:
     if not settings.REGISTRATION_OPEN or request.user.is_authenticated:
         return HttpResponseForbidden()
 
@@ -215,7 +227,7 @@ def signup_csrf(request):
 
 
 @require_POST
-def signup(request):
+def signup(request: HttpRequest) -> HttpResponse:
     if not settings.REGISTRATION_OPEN or request.user.is_authenticated:
         return HttpResponseForbidden()
 
@@ -223,11 +235,20 @@ def signup(request):
     form = forms.SignupForm(request)
     if form.is_valid():
         email = form.cleaned_data["identity"]
-        if not User.objects.filter(email=email).exists():
+        try:
+            user = User.objects.get(email=email)
+            # Sometimes existing users forget they already have an account.
+            # They use the signup form and are confused why no email arrives.
+            # To avoid this confusion, if we see the user account already exists,
+            # we will send them sign-in link even though they used the wrong form
+            # ("sign up" instead of "sign in").
+        except User.DoesNotExist:
+            # If the user does not exist, create a new user account.
             tz = form.cleaned_data["tz"]
             user = _make_user(email, tz)
-            profile = Profile.objects.for_user(user)
-            profile.send_instant_login_link()
+
+        profile = Profile.objects.for_user(user)
+        profile.send_instant_login_link()
     else:
         ctx = {"form": form}
 
@@ -238,11 +259,13 @@ def signup(request):
     return response
 
 
-def login_link_sent(request):
+def login_link_sent(request: HttpRequest) -> HttpResponse:
     return render(request, "accounts/login_link_sent.html")
 
 
-def check_token(request, username, token, new_email=None):
+def check_token(
+    request: HttpRequest, username: str, token: str, new_email: str | None = None
+) -> HttpResponse:
     if request.user.is_authenticated:
         auth_logout(request)
 
@@ -257,6 +280,7 @@ def check_token(request, username, token, new_email=None):
 
     user = authenticate(username=username, token=token)
     if user is not None and user.is_active:
+        assert isinstance(user, User)
         if new_email:
             if User.objects.filter(email=new_email).exists():
                 request.session["bad_link"] = True
@@ -275,7 +299,7 @@ def check_token(request, username, token, new_email=None):
 
 
 @login_required
-def profile(request):
+def profile(request: AuthenticatedHttpRequest) -> HttpResponse:
     profile = request.profile
 
     ctx = {
@@ -320,13 +344,13 @@ def profile(request):
 
 @login_required
 @require_POST
-def add_project(request):
+def add_project(request: AuthenticatedHttpRequest) -> HttpResponse:
     form = forms.ProjectNameForm(request.POST)
     if not form.is_valid():
         return HttpResponseBadRequest()
 
     project = Project(owner=request.user)
-    project.code = project.badge_key = str(uuid.uuid4())
+    project.code = project.badge_key = str(uuid4())
     project.name = form.cleaned_data["name"]
     project.save()
 
@@ -334,7 +358,7 @@ def add_project(request):
 
 
 @login_required
-def project(request, code):
+def project(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = get_object_or_404(Project, code=code)
     is_owner = project.owner_id == request.user.id
 
@@ -395,9 +419,9 @@ def project(request, code):
             if not is_manager:
                 return HttpResponseForbidden()
 
-            form = forms.InviteTeamMemberForm(request.POST)
-            if form.is_valid():
-                email = form.cleaned_data["email"]
+            invite_form = forms.InviteTeamMemberForm(request.POST)
+            if invite_form.is_valid():
+                email = invite_form.cleaned_data["email"]
 
                 invite_suggestions = project.invite_suggestions()
                 if not invite_suggestions.filter(email=email).exists():
@@ -414,7 +438,7 @@ def project(request, code):
                 except User.DoesNotExist:
                     user = _make_user(email, with_project=False)
 
-                if project.invite(user, role=form.cleaned_data["role"]):
+                if project.invite(user, role=invite_form.cleaned_data["role"]):
                     ctx["team_member_invited"] = email
                     ctx["team_status"] = "success"
                 else:
@@ -425,11 +449,12 @@ def project(request, code):
             if not is_manager:
                 return HttpResponseForbidden()
 
-            form = forms.RemoveTeamMemberForm(request.POST)
-            if form.is_valid():
-                q = User.objects
-                q = q.filter(email=form.cleaned_data["email"])
-                q = q.filter(memberships__project=project)
+            remove_form = forms.RemoveTeamMemberForm(request.POST)
+            if remove_form.is_valid():
+                q = User.objects.filter(
+                    email=remove_form.cleaned_data["email"],
+                    memberships__project=project,
+                )
                 farewell_user = q.first()
                 if farewell_user is None:
                     return HttpResponseBadRequest()
@@ -439,15 +464,15 @@ def project(request, code):
 
                 Member.objects.filter(project=project, user=farewell_user).delete()
 
-                ctx["team_member_removed"] = form.cleaned_data["email"]
+                ctx["team_member_removed"] = remove_form.cleaned_data["email"]
                 ctx["team_status"] = "info"
         elif "set_project_name" in request.POST:
             if not rw:
                 return HttpResponseForbidden()
 
-            form = forms.ProjectNameForm(request.POST)
-            if form.is_valid():
-                project.name = form.cleaned_data["name"]
+            name_form = forms.ProjectNameForm(request.POST)
+            if name_form.is_valid():
+                project.name = name_form.cleaned_data["name"]
                 project.save()
 
                 ctx["project_name_updated"] = True
@@ -457,10 +482,10 @@ def project(request, code):
             if not is_owner:
                 return HttpResponseForbidden()
 
-            form = forms.TransferForm(request.POST)
-            if form.is_valid():
+            transfer_form = forms.TransferForm(request.POST)
+            if transfer_form.is_valid():
                 # Look up the proposed new owner
-                email = form.cleaned_data["email"]
+                email = transfer_form.cleaned_data["email"]
                 try:
                     membership = project.member_set.filter(user__email=email).get()
                 except Member.DoesNotExist:
@@ -521,14 +546,14 @@ def project(request, code):
             tr.transfer_request_date = None
             tr.save()
 
-    q = project.member_set.select_related("user").order_by("user__email")
-    ctx["memberships"] = list(q)
+    mq = project.member_set.select_related("user").order_by("user__email")
+    ctx["memberships"] = list(mq)
     ctx["can_invite_new_users"] = project.can_invite_new_users()
     return render(request, "accounts/project.html", ctx)
 
 
 @login_required
-def notifications(request):
+def notifications(request: AuthenticatedHttpRequest) -> HttpResponse:
     profile = request.profile
 
     ctx = {
@@ -564,7 +589,7 @@ def notifications(request):
 @login_required
 @sensitive_post_parameters()
 @require_sudo_mode
-def set_password(request):
+def set_password(request: AuthenticatedHttpRequest) -> HttpResponse:
     if request.method == "POST":
         form = forms.SetPasswordForm(request.POST)
         if form.is_valid():
@@ -587,7 +612,7 @@ def set_password(request):
 
 @login_required
 @require_sudo_mode
-def change_email(request):
+def change_email(request: AuthenticatedHttpRequest) -> HttpResponse:
     if "sent" in request.session:
         ctx = {"email": request.session.pop("sent")}
         return render(request, "accounts/change_email_instructions.html", ctx)
@@ -615,7 +640,7 @@ def change_email(request):
     return render(request, "accounts/change_email.html", {"form": form})
 
 
-def change_email_verify(request, signed_payload):
+def change_email_verify(request: HttpRequest, signed_payload: str) -> HttpResponse:
     try:
         payload = TimestampSigner().unsign_object(signed_payload, max_age=900)
     except BadSignature:
@@ -625,7 +650,7 @@ def change_email_verify(request, signed_payload):
 
 
 @csrf_exempt
-def unsubscribe_reports(request, signed_username):
+def unsubscribe_reports(request: HttpRequest, signed_username: str) -> HttpResponse:
     # Some email servers open links in emails to check for malicious content.
     # To work around this, for GET requests we serve a confirmation form.
     # If the signature is more than 5 minutes old, we also include JS code to
@@ -669,7 +694,7 @@ def unsubscribe_reports(request, signed_username):
 
 @login_required
 @require_sudo_mode
-def close(request):
+def close(request: AuthenticatedHttpRequest) -> HttpResponse:
     user = request.user
 
     if request.method == "POST":
@@ -682,7 +707,8 @@ def close(request):
             user.delete()
 
             request.session.flush()
-            return redirect("hc-login")
+            path = reverse("hc-login") + "?account-closed"
+            return redirect(path)
 
     ctx = {}
     if "confirmation" in request.POST:
@@ -693,15 +719,17 @@ def close(request):
 
 @require_POST
 @login_required
-def remove_project(request, code):
+def remove_project(request: AuthenticatedHttpRequest, code: str) -> HttpResponse:
     project = get_object_or_404(Project, code=code, owner=request.user)
+    for check in project.check_set.all():
+        check.lock_and_delete()
     project.delete()
     return redirect("hc-index")
 
 
 @login_required
 @require_sudo_mode
-def add_webauthn(request):
+def add_webauthn(request: AuthenticatedHttpRequest) -> HttpResponse:
     if not settings.RP_ID:
         return HttpResponse(status=404)
 
@@ -714,8 +742,10 @@ def add_webauthn(request):
             return HttpResponseBadRequest()
 
         state = request.session["state"]
-        credential_bytes = helper.verify(state, form.cleaned_data["response"])
-        if credential_bytes is None:
+        try:
+            credential_bytes = helper.verify(state, form.cleaned_data["response"])
+        except ValueError:
+            logger.exception("CreateHelper.verify failed, form: %s", form.cleaned_data)
             return HttpResponseBadRequest()
 
         c = Credential(user=request.user)
@@ -733,7 +763,7 @@ def add_webauthn(request):
 
 @login_required
 @require_sudo_mode
-def add_totp(request):
+def add_totp(request: AuthenticatedHttpRequest) -> HttpResponse:
     if request.profile.totp:
         # TOTP is already configured, refuse to continue
         return HttpResponseBadRequest()
@@ -768,7 +798,7 @@ def add_totp(request):
 
 @login_required
 @require_sudo_mode
-def remove_totp(request):
+def remove_totp(request: AuthenticatedHttpRequest) -> HttpResponse:
     if request.method == "POST" and "disable_totp" in request.POST:
         request.profile.totp = None
         request.profile.totp_created = None
@@ -782,7 +812,7 @@ def remove_totp(request):
 
 @login_required
 @require_sudo_mode
-def remove_credential(request, code):
+def remove_credential(request: AuthenticatedHttpRequest, code: str) -> HttpResponse:
     if not settings.RP_ID:
         return HttpResponse(status=404)
 
@@ -805,7 +835,7 @@ def remove_credential(request, code):
     return render(request, "accounts/remove_credential.html", ctx)
 
 
-def login_webauthn(request):
+def login_webauthn(request: HttpRequest) -> HttpResponse:
     # We require RP_ID. Fail predicably if it is not set:
     if not settings.RP_ID:
         return HttpResponse(status=404)
@@ -858,7 +888,7 @@ def login_webauthn(request):
     return render(request, "accounts/login_webauthn.html", ctx)
 
 
-def login_totp(request):
+def login_totp(request: HttpRequest) -> HttpResponse:
     # Expect an unauthenticated user
     if request.user.is_authenticated:
         return HttpResponseBadRequest()
@@ -902,7 +932,7 @@ def login_totp(request):
 
 
 @login_required
-def appearance(request):
+def appearance(request: AuthenticatedHttpRequest) -> HttpResponse:
     profile = request.profile
 
     ctx = {
@@ -913,7 +943,7 @@ def appearance(request):
 
     if request.method == "POST":
         theme = request.POST.get("theme", "")
-        if theme in ("", "dark"):
+        if theme in ("", "dark", "system"):
             profile.theme = theme
             profile.save()
             ctx["status"] = "info"

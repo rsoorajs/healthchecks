@@ -3,27 +3,39 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 import socket
 from io import BytesIO
+from json import dumps, loads
+from typing import Any, cast
 from urllib.parse import urlencode
 
 import pycurl
 from django.conf import settings
 
+from hc.lib.typealias import JSONValue
+
+CurlSockAddr = tuple[int, int, int, tuple[str, int]]
+
+# Type aliases for the arguments of the request function
+Data = dict[str, Any] | str | bytes | None
+Headers = dict[str, str] | None
+Timeout = int | None
+Params = dict[str, str] | None
+Auth = tuple[str, str] | None
+
 
 class CurlError(Exception):
-    def __init__(self, message) -> None:
+    def __init__(self, message: str) -> None:
         self.message = message
 
 
-class Response(object):
+class Response:
     def __init__(self, status_code: int, content: bytes) -> None:
         self.status_code = status_code
         self.content = content
 
-    def json(self):
-        return json.loads(self.content.decode())
+    def json(self) -> JSONValue:
+        return cast(JSONValue, loads(self.content.decode()))
 
     @property
     def text(self) -> str:
@@ -36,7 +48,17 @@ def _makeheader(k: str, v: str) -> bytes:
     return key_bytes + b":" + value_bytes
 
 
-def request(method: str, url: str, **kwargs) -> Response:
+def request(
+    method: str,
+    url: str,
+    *,
+    params: Params = None,
+    data: Data = None,
+    json: Any = None,
+    headers: Headers = None,
+    auth: Auth = None,
+    timeout: Timeout = None,
+) -> Response:
     """Make a HTTP request using pycurl, return a Response object.
 
     The `method` argument specifies the HTTP verb, and must be
@@ -101,7 +123,7 @@ def request(method: str, url: str, **kwargs) -> Response:
 
     opensocket_rejected_ips = []
 
-    def opensocket(purpose, curl_address):
+    def opensocket(purpose: int, curl_address: CurlSockAddr) -> socket.socket | int:
         family, socktype, protocol, address = curl_address
         if not settings.INTEGRATIONS_ALLOW_PRIVATE_IPS:
             if ipaddress.ip_address(address[0]).is_private:
@@ -116,21 +138,21 @@ def request(method: str, url: str, **kwargs) -> Response:
     c.setopt(pycurl.OPENSOCKETFUNCTION, opensocket)
     c.setopt(pycurl.FOLLOWLOCATION, True)  # Allow redirects
     c.setopt(pycurl.MAXREDIRS, 3)
-    if "timeout" in kwargs:
-        c.setopt(pycurl.TIMEOUT, kwargs["timeout"])
+    if timeout is not None:
+        c.setopt(pycurl.TIMEOUT, timeout)
 
-    if "params" in kwargs:
-        url += "?" + urlencode(kwargs["params"])
+    if params is not None:
+        url += "?" + urlencode(params)
     c.setopt(pycurl.URL, url.encode())
 
-    if "auth" in kwargs:
-        c.setopt(pycurl.USERPWD, "%s:%s" % kwargs["auth"])
+    if auth is not None:
+        c.setopt(pycurl.USERPWD, "%s:%s" % auth)
 
-    headers = kwargs.get("headers", {})
-    data = kwargs.get("data", "")
+    if headers is None:
+        headers = {}
 
-    if "json" in kwargs:
-        data = json.dumps(kwargs["json"])
+    if json is not None:
+        data = dumps(json)
         headers["Content-Type"] = "application/json"
 
     if "User-Agent" not in headers:
@@ -181,9 +203,38 @@ def request(method: str, url: str, **kwargs) -> Response:
     return Response(status, buffer.getvalue())
 
 
-def post(url: str, data=None, **kwargs):
-    return request("post", url, data=data, **kwargs)
+# Convenience wrapper around request for making "GET" requests
+def get(
+    url: str,
+    params: Params = None,
+    *,
+    headers: Headers = None,
+    auth: Auth = None,
+    timeout: Timeout = None,
+) -> Response:
+    return request(
+        "get", url, params=params, headers=headers, auth=auth, timeout=timeout
+    )
 
 
-def get(url: str, **kwargs):
-    return request("get", url, **kwargs)
+# Convenience wrapper around request for making "POST" requests
+def post(
+    url: str,
+    data: Data = None,
+    *,
+    params: Params = None,
+    json: Any = None,
+    headers: Headers = None,
+    auth: Auth = None,
+    timeout: Timeout = None,
+) -> Response:
+    return request(
+        "post",
+        url,
+        params=params,
+        data=data,
+        json=json,
+        headers=headers,
+        auth=auth,
+        timeout=timeout,
+    )

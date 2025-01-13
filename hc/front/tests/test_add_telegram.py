@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from django.core import signing
 from django.test.utils import override_settings
 
 from hc.api.models import Channel
+from hc.lib.typealias import JSONList
 from hc.test import BaseTestCase
 
 
@@ -14,27 +15,27 @@ class AddTelegramTestCase(BaseTestCase):
     url = "/integrations/add_telegram/"
     bot_url = "/integrations/telegram/bot/"
 
-    def test_instructions_work(self):
+    def test_instructions_work(self) -> None:
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url)
         self.assertContains(r, "start@ExampleBot")
 
     @override_settings(TELEGRAM_TOKEN=None)
-    def test_it_requires_token(self):
+    def test_it_requires_token(self) -> None:
         payload = signing.dumps({"id": 123, "type": "group", "name": "My Group"})
 
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url + "?" + payload)
         self.assertEqual(r.status_code, 404)
 
-    def test_it_shows_confirmation(self):
+    def test_it_shows_confirmation(self) -> None:
         payload = signing.dumps({"id": 123, "type": "group", "name": "My Group"})
 
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url + "?" + payload)
         self.assertContains(r, "My Group")
 
-    def test_it_works(self):
+    def test_it_works(self) -> None:
         payload = signing.dumps({"id": 123, "type": "group", "name": "My Group"})
 
         self.client.login(username="alice@example.org", password="password")
@@ -44,13 +45,13 @@ class AddTelegramTestCase(BaseTestCase):
 
         c = Channel.objects.get()
         self.assertEqual(c.kind, "telegram")
-        self.assertEqual(c.telegram_id, 123)
-        self.assertEqual(c.telegram_type, "group")
-        self.assertEqual(c.telegram_name, "My Group")
-        self.assertEqual(c.telegram_thread_id, None)
+        self.assertEqual(c.telegram.id, 123)
+        self.assertEqual(c.telegram.type, "group")
+        self.assertEqual(c.telegram.name, "My Group")
+        self.assertEqual(c.telegram.thread_id, None)
         self.assertEqual(c.project, self.project)
 
-    def test_it_saves_thread_id(self):
+    def test_it_saves_thread_id(self) -> None:
         payload = signing.dumps(
             {"id": 123, "type": "group", "name": "My Group", "thread_id": 456}
         )
@@ -62,18 +63,18 @@ class AddTelegramTestCase(BaseTestCase):
 
         c = Channel.objects.get()
         self.assertEqual(c.kind, "telegram")
-        self.assertEqual(c.telegram_id, 123)
-        self.assertEqual(c.telegram_thread_id, 456)
+        self.assertEqual(c.telegram.id, 123)
+        self.assertEqual(c.telegram.thread_id, 456)
 
-    def test_it_handles_bad_signature(self):
+    def test_it_handles_bad_signature(self) -> None:
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url + "?bad-signature")
         self.assertContains(r, "Incorrect Link")
 
         self.assertFalse(Channel.objects.exists())
 
-    @patch("hc.api.transports.curl.request")
-    def test_bot_sends_invite(self, mock_request):
+    @patch("hc.api.transports.curl.request", autospec=True)
+    def test_bot_sends_invite(self, mock_request: Mock) -> None:
         mock_request.return_value.status_code = 200
 
         data = {
@@ -89,8 +90,8 @@ class AddTelegramTestCase(BaseTestCase):
         self.assertEqual(kwargs["json"]["chat_id"], 123)
         self.assertIsNone(kwargs["json"]["message_thread_id"])
 
-    @patch("hc.api.transports.curl.request")
-    def test_bot_sends_invite_to_thread(self, mock_request):
+    @patch("hc.api.transports.curl.request", autospec=True)
+    def test_bot_sends_invite_to_thread(self, mock_request: Mock) -> None:
         mock_request.return_value.status_code = 200
 
         data = {
@@ -107,8 +108,8 @@ class AddTelegramTestCase(BaseTestCase):
         self.assertEqual(kwargs["json"]["chat_id"], 123)
         self.assertEqual(kwargs["json"]["message_thread_id"], 456)
 
-    @patch("hc.api.transports.curl.request")
-    def test_bot_handles_channel_post(self, mock_request):
+    @patch("hc.api.transports.curl.request", autospec=True)
+    def test_bot_handles_channel_post(self, mock_request: Mock) -> None:
         mock_request.return_value.status_code = 200
 
         data = {
@@ -121,9 +122,9 @@ class AddTelegramTestCase(BaseTestCase):
         self.assertEqual(r.status_code, 200)
         mock_request.assert_called_once()
 
-    @patch("hc.api.transports.curl.request")
-    def test_bot_handles_bad_message(self, mock_get):
-        samples = ["", "{}"]
+    @patch("hc.api.transports.curl.request", autospec=True)
+    def test_bot_handles_bad_message(self, mock_get: Mock) -> None:
+        samples: JSONList = ["", "{}"]
 
         # text is missing
         samples.append({"message": {"chat": {"id": 123, "type": "group"}}})
@@ -156,8 +157,8 @@ class AddTelegramTestCase(BaseTestCase):
         # It should not have sent an invite for any of the samples
         mock_get.assert_not_called()
 
-    @patch("hc.api.transports.curl.request")
-    def test_bot_handles_send_failure(self, mock_request):
+    @patch("hc.api.transports.curl.request", autospec=True)
+    def test_bot_handles_send_failure(self, mock_request: Mock) -> None:
         mock_request.return_value.status_code = 403
 
         data = {
@@ -171,7 +172,7 @@ class AddTelegramTestCase(BaseTestCase):
         self.assertEqual(r.status_code, 200)
         mock_request.assert_called()
 
-    def test_it_requires_rw_access(self):
+    def test_it_requires_rw_access(self) -> None:
         self.bobs_membership.role = "r"
         self.bobs_membership.save()
 

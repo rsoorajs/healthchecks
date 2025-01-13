@@ -10,7 +10,7 @@ from hc.test import BaseTestCase
 
 @override_settings(TWILIO_ACCOUNT="foo", TWILIO_AUTH="foo", TWILIO_FROM="123")
 class EditSmsTestCase(BaseTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.check = Check.objects.create(project=self.project)
 
@@ -22,14 +22,14 @@ class EditSmsTestCase(BaseTestCase):
 
         self.url = f"/integrations/{self.channel.code}/edit/"
 
-    def test_instructions_work(self):
+    def test_instructions_work(self) -> None:
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url)
         self.assertContains(r, "SMS Settings")
         self.assertContains(r, "Get a SMS message")
         self.assertContains(r, "+12345678")
 
-    def test_it_updates_channel(self):
+    def test_it_updates_channel(self) -> None:
         form = {"label": "My Phone", "phone": "+1234567890", "down": True}
 
         self.client.login(username="alice@example.org", password="password")
@@ -37,21 +37,21 @@ class EditSmsTestCase(BaseTestCase):
         self.assertRedirects(r, self.channels_url)
 
         self.channel.refresh_from_db()
-        self.assertEqual(self.channel.phone_number, "+1234567890")
+        self.assertEqual(self.channel.phone.value, "+1234567890")
         self.assertEqual(self.channel.name, "My Phone")
-        self.assertTrue(self.channel.sms_notify_down)
-        self.assertFalse(self.channel.sms_notify_up)
+        self.assertTrue(self.channel.phone.notify_down)
+        self.assertFalse(self.channel.phone.notify_up)
 
         # Make sure it does not call assign_all_checks
         self.assertFalse(self.channel.checks.exists())
 
     @override_settings(TWILIO_AUTH=None)
-    def test_it_requires_credentials(self):
+    def test_it_requires_credentials(self) -> None:
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url)
         self.assertEqual(r.status_code, 404)
 
-    def test_it_requires_rw_access(self):
+    def test_it_requires_rw_access(self) -> None:
         self.bobs_membership.role = "r"
         self.bobs_membership.save()
 

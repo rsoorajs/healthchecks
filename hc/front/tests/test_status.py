@@ -5,33 +5,37 @@ from hc.test import BaseTestCase
 
 
 class StatusTestCase(BaseTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.check = Check(project=self.project, name="Alice Was Here")
         self.check.tags = "foo"
         self.check.save()
 
-        self.url = "/projects/%s/checks/status/" % self.project.code
+        self.url = f"/projects/{self.project.code}/checks/status/"
 
-    def test_it_works(self):
+    def test_it_works(self) -> None:
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url)
         self.assertEqual(r.status_code, 200)
         doc = r.json()
 
-        self.assertEqual(doc["tags"]["foo"], "up")
+        self.assertEqual(doc["tags"]["foo"], ["up", "1 up"])
 
         detail = doc["details"][0]
         self.assertEqual(detail["code"], str(self.check.code))
         self.assertEqual(detail["status"], "new")
         self.assertIn("Never", detail["last_ping"])
 
-    def test_it_allows_cross_team_access(self):
+    def test_it_returns_403_for_anon_requests(self) -> None:
+        r = self.client.get(self.url)
+        self.assertEqual(r.status_code, 403)
+
+    def test_it_allows_cross_team_access(self) -> None:
         self.client.login(username="bob@example.org", password="password")
         r = self.client.get(self.url)
         self.assertEqual(r.status_code, 200)
 
-    def test_it_checks_ownership(self):
+    def test_it_checks_ownership(self) -> None:
         self.client.login(username="charlie@example.org", password="password")
         r = self.client.get(self.url)
         self.assertEqual(r.status_code, 404)

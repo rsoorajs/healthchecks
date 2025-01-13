@@ -2,25 +2,31 @@ from __future__ import annotations
 
 import email
 import json
+import logging
 import os
 import re
 import sqlite3
-import sys
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
+from collections.abc import Iterable
+from datetime import datetime
 from datetime import timedelta as td
+from email.message import EmailMessage
+from itertools import islice
 from secrets import token_urlsafe
+from typing import Literal, TypedDict, cast
 from urllib.parse import urlencode, urlparse
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from cronsim import CronSim, CronSimError
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
-from django.contrib.auth.models import User
 from django.core import signing
 from django.core.exceptions import PermissionDenied
-from django.db.models import Count, F
+from django.db.models import Case, Count, F, Q, QuerySet, When
+from django.db.models.functions import Substr
 from django.http import (
     Http404,
     HttpRequest,
@@ -35,37 +41,38 @@ from django.urls import reverse
 from django.utils.timezone import now
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
+from django_stubs_ext import WithAnnotations
+from oncalendar import OnCalendar, OnCalendarError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from hc.accounts.models import Member, Project
+from hc.accounts.http import AuthenticatedHttpRequest
+from hc.accounts.models import Member, Profile, Project
 from hc.api.models import (
     DEFAULT_GRACE,
     DEFAULT_TIMEOUT,
     MAX_DURATION,
     Channel,
     Check,
+    Flip,
     Notification,
     Ping,
     TokenBucket,
 )
-from hc.api.transports import Signal, Telegram, TransportError
+from hc.api.transports import Signal, SignalRateLimitFailure, Telegram, TransportError
 from hc.front import forms
 from hc.front.decorators import require_setting
-from hc.front.schemas import telegram_callback
 from hc.front.templatetags.hc_extras import (
     down_title,
     num_down_title,
     site_hostname,
     sortchecks,
 )
-from hc.lib import curl, jsonschema
+from hc.lib import curl
 from hc.lib.badges import get_badge_url
 from hc.lib.tz import all_timezones
+from hc.lib.urls import absolute_reverse
 
-if sys.version_info >= (3, 9):
-    from zoneinfo import ZoneInfo
-else:
-    from backports.zoneinfo import ZoneInfo
-
+logger = logging.getLogger(__name__)
 
 VALID_SORT_VALUES = ("name", "-name", "last_ping", "-last_ping", "created")
 STATUS_TEXT_TMPL = get_template("front/log_status_text.html")
@@ -74,25 +81,39 @@ EVENTS_TMPL = get_template("front/details_events.html")
 DOWNTIMES_TMPL = get_template("front/details_downtimes.html")
 
 
-def _tags_statuses(checks):
-    tags, down, grace, num_down = {}, {}, {}, 0
+def _tags_counts(checks: Iterable[Check]) -> tuple[list[tuple[str, str, str]], int]:
+    num_down = 0
+    grace = set()
+    counts: Counter[str] = Counter()
+    down_counts: Counter[str] = Counter()
     for check in checks:
-        status = check.get_status()
-
-        if status == "down":
+        counts.update(check.tags_list())
+        if check.cached_status == "down":
             num_down += 1
-            for tag in check.tags_list():
-                down[tag] = "down"
-        elif status == "grace":
-            for tag in check.tags_list():
-                grace[tag] = "grace"
-        else:
-            for tag in check.tags_list():
-                tags[tag] = "up"
+            down_counts.update(check.tags_list())
+        elif check.cached_status == "grace":
+            grace.update(check.tags_list())
 
-    tags.update(grace)
-    tags.update(down)
-    return tags, num_down
+    result = []
+    for tag in counts:
+        if tag in down_counts:
+            status = "down"
+            text = f"{down_counts[tag]} of {counts[tag]} down"
+        else:
+            status = "grace" if tag in grace else "up"
+            text = f"{counts[tag]} up"
+
+        result.append((tag, status, text))
+
+    return result, num_down
+
+
+def _common_timezones(checks: Iterable[Check]) -> list[str]:
+    counter: Counter[str] = Counter()
+    for check in checks:
+        counter[check.tz] += 1
+
+    return [tz for tz, _ in counter.most_common(3)]
 
 
 def _get_check_for_user(
@@ -180,24 +201,38 @@ def _get_rw_project_for_user(request: HttpRequest, code: UUID) -> Project:
     return project
 
 
-def _refresh_last_active_date(profile):
+def _refresh_last_active_date(request: AuthenticatedHttpRequest) -> None:
     """Update last_active_date if it is more than a day old."""
 
+    profile = request.profile
     if profile.last_active_date is None or (now() - profile.last_active_date).days > 0:
         profile.last_active_date = now()
         profile.save()
 
+        # Also modify session to trigger session cookie refresh
+        # and push forward its expiry date:
+        request.session["last_active"] = profile.last_active_date.timestamp()
 
-def _get_referer_qs(request):
+    return None
+
+
+def _get_referer_qs(request: HttpRequest) -> str:
     parsed = urlparse(request.META.get("HTTP_REFERER", ""))
     if parsed.query:
+        assert isinstance(parsed.query, str)
         return "?" + parsed.query
     return ""
 
 
+def _status_match(check: Check, statuses: set[str]) -> bool:
+    if "started" in statuses and check.last_start:
+        return True
+    return check.cached_status in statuses
+
+
 @login_required
-def my_checks(request, code):
-    _refresh_last_active_date(request.profile)
+def checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+    _refresh_last_active_date(request)
     project, rw = _get_project_for_user(request, code)
 
     if request.GET.get("sort") in VALID_SORT_VALUES:
@@ -216,12 +251,13 @@ def my_checks(request, code):
     checks = list(q.prefetch_related("channel_set"))
     sortchecks(checks, request.profile.sort)
 
-    tags_statuses, num_down = _tags_statuses(checks)
-    pairs = list(tags_statuses.items())
-    pairs.sort(key=lambda pair: pair[0].lower())
+    tags_counts, num_down = _tags_counts(checks)
+    tags_counts.sort(key=lambda item: item[0].lower())
 
-    channels = Channel.objects.filter(project=project)
-    channels = list(channels.order_by("created"))
+    is_group = Case(When(kind="group", then=0), default=1)
+    channels = project.channel_set.annotate(is_group=is_group)
+    # Sort groups first, then in the creation order
+    channels = channels.order_by("is_group", "created")
 
     hidden_checks = set()
     # Hide checks that don't match selected tags:
@@ -235,8 +271,15 @@ def my_checks(request, code):
     search = request.GET.get("search", "")
     if search:
         for check in checks:
-            search_key = "%s\n%s" % (check.name.lower(), check.code)
-            if search not in search_key:
+            haystack = f"{check.name}\n{check.slug}\n{check.code}"
+            if search not in haystack.lower():
+                hidden_checks.add(check)
+
+    # Hide checks that don't match status filters
+    selected_statuses = set(request.GET.getlist("status", []))
+    if selected_statuses:
+        for check in checks:
+            if not _status_match(check, selected_statuses):
                 hidden_checks.add(check)
 
     # Figure out which checks have ambiguous ping URLs
@@ -261,24 +304,29 @@ def my_checks(request, code):
         "checks": checks,
         "channels": channels,
         "num_down": num_down,
-        "tags": pairs,
+        "tags": tags_counts,
         "ping_endpoint": settings.PING_ENDPOINT,
+        "common_timezones": _common_timezones(checks),
         "timezones": all_timezones,
         "project": project,
         "num_available": project.num_checks_available(),
         "sort": request.profile.sort,
         "selected_tags": selected_tags,
+        "selected_statuses": selected_statuses,
         "search": search,
         "hidden_checks": hidden_checks,
+        "num_visible": len(checks) - len(hidden_checks),
         "ambiguous": ambiguous,
         "show_last_duration": show_last_duration,
     }
 
-    return render(request, "front/my_checks.html", ctx)
+    return render(request, "front/checks.html", ctx)
 
 
-@login_required
-def status(request, code):
+def status(request: HttpRequest, code: UUID) -> HttpResponse:
+    if not request.user.is_authenticated:
+        return HttpResponseForbidden()
+
     project, rw = _get_project_for_user(request, code)
     checks = list(Check.objects.filter(project=project))
 
@@ -294,15 +342,18 @@ def status(request, code):
             }
         )
 
-    tags_statuses, num_down = _tags_statuses(checks)
+    tags_counts, num_down = _tags_counts(checks)
+    tags = {tag: (status, tooltip) for tag, status, tooltip in tags_counts}
     return JsonResponse(
-        {"details": details, "tags": tags_statuses, "title": num_down_title(num_down)}
+        {"details": details, "tags": tags, "title": num_down_title(num_down)}
     )
 
 
 @login_required
 @require_POST
-def switch_channel(request, code, channel_code):
+def switch_channel(
+    request: AuthenticatedHttpRequest, code: UUID, channel_code: UUID
+) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     channel = get_object_or_404(Channel, code=channel_code)
@@ -317,8 +368,15 @@ def switch_channel(request, code, channel_code):
     return HttpResponse()
 
 
-def _get_project_summary(profile):
-    statuses = defaultdict(lambda: {"status": "up", "started": False})
+class ProjectStatus(TypedDict):
+    status: str
+    started: bool
+
+
+def _get_project_summary(profile: Profile) -> dict[UUID, ProjectStatus]:
+    statuses: dict[UUID, ProjectStatus] = defaultdict(
+        lambda: {"status": "up", "started": False}
+    )
     q = profile.checks_from_all_projects()
     q = q.annotate(project_code=F("project__code"))
     for check in q:
@@ -334,10 +392,13 @@ def _get_project_summary(profile):
     return statuses
 
 
-def index(request):
+def index(request: HttpRequest) -> HttpResponse:
     if not request.user.is_authenticated:
         return redirect("hc-login")
 
+    # We now know user is logged, tell the type checker request.profile exists-
+    request = cast(AuthenticatedHttpRequest, request)
+    _refresh_last_active_date(request)
     summary = _get_project_summary(request.profile)
     if "refresh" in request.GET:
         return JsonResponse({str(k): v for k, v in summary.items()})
@@ -347,29 +408,33 @@ def index(request):
     q = q.annotate(n_channels=Count("channel", distinct=True))
     q = q.annotate(owner_email=F("owner__email"))
     projects = list(q)
+    any_down = False
     for project in projects:
-        project.overall_status = summary[project.code]["status"]
-        project.any_started = summary[project.code]["started"]
+        setattr(project, "overall_status", summary[project.code]["status"])
+        setattr(project, "any_started", summary[project.code]["started"])
+        if summary[project.code]["status"] == "down":
+            any_down = True
 
     # The list returned by projects() is already sorted . Do an additional sorting pass
     # to move projects with overall_status=down to the front (without changing their
     # relative order)
-    projects.sort(key=lambda p: p.overall_status != "down")
+    projects.sort(key=lambda p: getattr(p, "overall_status") != "down")
 
     ctx = {
         "page": "projects",
         "projects": projects,
         "last_project_id": request.session.get("last_project_id"),
+        "any_down": any_down,
     }
 
     return render(request, "front/projects.html", ctx)
 
 
 @login_required
-def projects_menu(request):
+def projects_menu(request: AuthenticatedHttpRequest) -> HttpResponse:
     projects = list(request.profile.projects())
 
-    statuses = defaultdict(lambda: "up")
+    statuses: dict[int, str] = defaultdict(lambda: "up")
     for check in Check.objects.filter(project__in=projects):
         old_status = statuses[check.project_id]
         if old_status != "down":
@@ -378,16 +443,16 @@ def projects_menu(request):
                 statuses[check.project_id] = status
 
     for p in projects:
-        p.overall_status = statuses[p.id]
+        setattr(p, "overall_status", statuses[p.id])
 
     return render(request, "front/projects_menu.html", {"projects": projects})
 
 
-def dashboard(request):
+def dashboard(request: HttpRequest) -> HttpResponse:
     return render(request, "front/dashboard.html", {})
 
 
-def _replace_placeholders(doc, html):
+def _replace_placeholders(doc: str, html: str) -> str:
     if doc.startswith("self_hosted"):
         return html
 
@@ -417,7 +482,7 @@ def _replace_placeholders(doc, html):
     return html
 
 
-def serve_doc(request, doc="introduction"):
+def serve_doc(request: HttpRequest, doc: str = "introduction") -> HttpResponse:
     # Filenames in /templates/docs/ consist of lowercase letters and underscores,
     # -- make sure we don't accept anything else
     if not re.match(r"^[0-9a-z_]+$", doc):
@@ -442,11 +507,10 @@ def serve_doc(request, doc="introduction"):
 
 
 @csrf_exempt
-def docs_search(request):
+def docs_search(request: HttpRequest) -> HttpResponse:
     form = forms.SearchForm(request.GET)
     if not form.is_valid():
-        ctx = {"results": []}
-        return render(request, "front/docs_search.html", ctx)
+        return render(request, "front/docs_search.html", {"results": []})
 
     query = """
         SELECT slug, title, snippet(docs, 2, '<span>', '</span>', '&hellip;', 10)
@@ -456,7 +520,9 @@ def docs_search(request):
         LIMIT 8
     """
 
-    q = form.cleaned_data["q"]
+    # Wrap the query in double quotes to get a valid FTS string
+    # https://www.sqlite.org/fts5.html#full_text_query_syntax
+    q = '"%s"' % form.cleaned_data["q"]
     con = sqlite3.connect(settings.BASE_DIR / "search.db")
     cur = con.cursor()
     res = cur.execute(query, (q,))
@@ -465,13 +531,13 @@ def docs_search(request):
     return render(request, "front/docs_search.html", ctx)
 
 
-def docs_cron(request):
+def docs_cron(request: HttpRequest) -> HttpResponse:
     return render(request, "front/docs_cron.html", {"page": "docs-cron"})
 
 
 @require_POST
 @login_required
-def add_check(request, code):
+def add_check(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     if project.num_checks_available() <= 0:
         return HttpResponseBadRequest()
@@ -500,7 +566,7 @@ def add_check(request, code):
 
 @require_POST
 @login_required
-def update_name(request, code):
+def update_name(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     form = forms.NameTagsForm(request.POST)
@@ -521,7 +587,7 @@ def update_name(request, code):
 
 @require_POST
 @login_required
-def filtering_rules(request, code):
+def filtering_rules(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     form = forms.FilteringRulesForm(request.POST)
@@ -541,43 +607,54 @@ def filtering_rules(request, code):
 
 @require_POST
 @login_required
-def update_timeout(request, code):
+def update_timeout(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     kind = request.POST.get("kind")
     if kind == "simple":
-        form = forms.TimeoutForm(request.POST)
-        if not form.is_valid():
+        simple_form = forms.TimeoutForm(request.POST)
+        if not simple_form.is_valid():
             return HttpResponseBadRequest()
 
         check.kind = "simple"
-        check.timeout = form.cleaned_data["timeout"]
-        check.grace = form.cleaned_data["grace"]
+        check.timeout = simple_form.cleaned_data["timeout"]
+        check.grace = simple_form.cleaned_data["grace"]
     elif kind == "cron":
-        form = forms.CronForm(request.POST)
-        if not form.is_valid():
+        cron_form = forms.CronForm(request.POST)
+        if not cron_form.is_valid():
             return HttpResponseBadRequest()
 
         check.kind = "cron"
-        check.schedule = form.cleaned_data["schedule"]
-        check.tz = form.cleaned_data["tz"]
-        check.grace = td(minutes=form.cleaned_data["grace"])
+        check.schedule = cron_form.cleaned_data["schedule"]
+        check.tz = cron_form.cleaned_data["tz"]
+        check.grace = cron_form.cleaned_data["grace"]
+    elif kind == "oncalendar":
+        oncalendar_form = forms.OnCalendarForm(request.POST)
+        if not oncalendar_form.is_valid():
+            return HttpResponseBadRequest()
+
+        check.kind = "oncalendar"
+        check.schedule = oncalendar_form.cleaned_data["schedule"]
+        check.tz = oncalendar_form.cleaned_data["tz"]
+        check.grace = oncalendar_form.cleaned_data["grace"]
 
     check.alert_after = check.going_down_after()
-    if check.status == "up" and check.alert_after < now():
-        # Checks can flip from "up" to "down" state as a result of changing check's
-        # schedule.  We don't want to send notifications when changing schedule
-        # interactively in the web UI. So we update the `alert_after` and `status`
-        # fields, and create a Flip object here the same way as `sendalerts` would do,
-        # but without sending an actual alert.
-        #
-        # We need to create the Flip object because otherwise the calculation
-        # in Check.downtimes() will come out wrong (when this check later comes up,
-        # we will have no record of when it went down).
-        check.create_flip("down", mark_as_processed=True)
+    if check.status == "up":
+        assert check.alert_after
+        if check.alert_after < now():
+            # Checks can flip from "up" to "down" state as a result of changing check's
+            # schedule.  We don't want to send notifications when changing schedule
+            # interactively in the web UI. So we update the `alert_after` and `status`
+            # fields, and create a Flip object here the same way as `sendalerts` would
+            # do, but without sending an actual alert.
+            #
+            # We need to create the Flip object because otherwise the calculation
+            # in Check.downtimes() will come out wrong (when this check later comes up,
+            # we will have no record of when it went down).
+            check.create_flip("down", mark_as_processed=True)
 
-        check.alert_after = None
-        check.status = "down"
+            check.alert_after = None
+            check.status = "down"
 
     check.save()
 
@@ -590,10 +667,10 @@ def update_timeout(request, code):
 
 
 @require_POST
-def cron_preview(request):
+def cron_preview(request: HttpRequest) -> HttpResponse:
     schedule = request.POST.get("schedule", "")
     tz = request.POST.get("tz")
-    ctx = {"tz": tz, "dates": []}
+    ctx: dict[str, object] = {"tz": tz}
 
     if tz not in all_timezones:
         ctx["bad_tz"] = True
@@ -602,31 +679,69 @@ def cron_preview(request):
     now_local = now().astimezone(ZoneInfo(tz))
     try:
         it = CronSim(schedule, now_local)
-        for i in range(0, 6):
-            ctx["dates"].append(next(it))
+        ctx["dates"] = list(islice(it, 0, 6))
         ctx["desc"] = it.explain()
-    except (CronSimError, StopIteration):
+    except CronSimError:
+        ctx["bad_schedule"] = True
+
+    if not ctx.get("dates"):
         ctx["bad_schedule"] = True
 
     return render(request, "front/cron_preview.html", ctx)
 
 
-def validate_schedule(request):
+@require_POST
+@login_required
+def oncalendar_preview(request: HttpRequest) -> HttpResponse:
+    schedule = request.POST.get("schedule", "")
+    tz = request.POST.get("tz")
+    ctx: dict[str, object] = {"tz": tz, "dates": []}
+
+    if tz not in all_timezones:
+        ctx["bad_tz"] = True
+        return render(request, "front/oncalendar_preview.html", ctx)
+
+    now_local = now().astimezone(ZoneInfo(tz))
+    try:
+        it = OnCalendar(schedule, now_local)
+        iterations = 6 if tz == "UTC" else 4
+        ctx["dates"] = list(islice(it, 0, iterations))
+    except OnCalendarError:
+        ctx["bad_schedule"] = True
+
+    if not ctx["dates"]:
+        ctx["bad_schedule"] = True
+
+    return render(request, "front/oncalendar_preview.html", ctx)
+
+
+def validate_schedule(request: HttpRequest) -> HttpResponse:
+    kind = request.GET.get("kind", "")
+    iterator: type[CronSim] | type[OnCalendar]
+    if kind == "cron":
+        iterator = CronSim
+    elif kind == "oncalendar":
+        iterator = OnCalendar
+    else:
+        return HttpResponseBadRequest()
+
     schedule = request.GET.get("schedule", "")
     result = True
     try:
-        # Does cronsim accept the schedule?
-        it = CronSim(schedule, now())
+        # Does cronsim/oncalendar accept the schedule?
+        it = iterator(schedule, now())
         # Can it calculate the next datetime?
         next(it)
-    except (CronSimError, StopIteration):
+    except (CronSimError, OnCalendarError, StopIteration):
         result = False
 
     return JsonResponse({"result": result})
 
 
 @login_required
-def ping_details(request, code, n=None):
+def ping_details(
+    request: AuthenticatedHttpRequest, code: UUID, n: int | None = None
+) -> HttpResponse:
     check, rw = _get_check_for_user(request, code)
     q = Ping.objects.filter(owner=check)
     if n:
@@ -651,8 +766,9 @@ def ping_details(request, code, n=None):
         "active": None,
     }
 
-    if ping.scheme == "email":
+    if ping.scheme == "email" and body:
         parsed = email.message_from_string(body, policy=email.policy.SMTP)
+        assert isinstance(parsed, EmailMessage)
         ctx["subject"] = parsed.get("subject", "")
 
         # The "active" tab is set to show the value that's successfully parsed last.
@@ -668,11 +784,13 @@ def ping_details(request, code, n=None):
 
         plain_mime_part = parsed.get_body(("plain",))
         if plain_mime_part:
+            assert isinstance(plain_mime_part, EmailMessage)
             ctx["plain"] = plain_mime_part.get_content()
             ctx["active"] = "plain"
 
         html_mime_part = parsed.get_body(("html",))
         if html_mime_part:
+            assert isinstance(html_mime_part, EmailMessage)
             ctx["html"] = html_mime_part.get_content()
             ctx["active"] = "html"
 
@@ -680,11 +798,15 @@ def ping_details(request, code, n=None):
 
 
 @login_required
-def ping_body(request, code, n):
+def ping_body(request: AuthenticatedHttpRequest, code: UUID, n: int) -> HttpResponse:
     check, rw = _get_check_for_user(request, code)
     ping = get_object_or_404(Ping, owner=check, n=n)
 
-    body = ping.get_body_bytes()
+    try:
+        body = ping.get_body_bytes()
+    except Ping.GetBodyError:
+        return HttpResponse(status=503)
+
     if not body:
         raise Http404("not found")
 
@@ -696,7 +818,7 @@ def ping_body(request, code, n):
 
 @require_POST
 @login_required
-def pause(request, code):
+def pause(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     # Track the status change for correct downtime calculation in Check.downtimes()
@@ -720,7 +842,7 @@ def pause(request, code):
 
 @require_POST
 @login_required
-def resume(request, code):
+def resume(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
     if check.status != "paused":
         return HttpResponseBadRequest()
@@ -738,7 +860,7 @@ def resume(request, code):
 
 @require_POST
 @login_required
-def remove_check(request: HttpRequest, code: UUID) -> HttpResponse:
+def remove_check(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     project = check.project
@@ -748,7 +870,7 @@ def remove_check(request: HttpRequest, code: UUID) -> HttpResponse:
 
 @require_POST
 @login_required
-def clear_events(request: HttpRequest, code: UUID) -> HttpResponse:
+def clear_events(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     check.status = "new"
@@ -766,22 +888,42 @@ def clear_events(request: HttpRequest, code: UUID) -> HttpResponse:
     return redirect("hc-details", code)
 
 
-def _get_events(check, page_limit, start=None, end=None):
+class PingAnnotations(TypedDict):
+    body_raw_preview: bytes
+
+
+def _get_events(
+    check: Check,
+    page_limit: int,
+    start: datetime,
+    end: datetime,
+    kinds: tuple[str, ...] | None = None,
+) -> list[Notification | WithAnnotations[Ping, PingAnnotations] | Flip]:
     # Sorting by "n" instead of "id" is important here. Both give the same
     # query results, but sorting by "id" can cause postgres to pick
     # api_ping.id index (slow if the api_ping table is big). Sorting by
     # "n" works around the problem--postgres picks the api_ping.owner_id index.
-    pings = check.visible_pings.order_by("-n")
-    if start and end:
-        pings = pings.filter(created__gte=start, created__lte=end)
+    pq = check.visible_pings.order_by("-n")
+    pq = pq.filter(created__gte=start, created__lte=end)
+    if kinds is not None:
+        kinds_filter = Q(kind__in=kinds)
+        if "success" in kinds:
+            kinds_filter = kinds_filter | Q(kind__isnull=True) | Q(kind="")
+        pq = pq.filter(kinds_filter)
 
-    pings = list(pings[:page_limit])
+    # Optimization: defer loading body_raw, instead load its first 150 bytes
+    # as "body_raw_preview". This reduces both network I/O to database, and disk I/O
+    # on the database host if the database contains large request bodies.
+    pq = pq.defer("body_raw")
+    pq = pq.annotate(body_raw_preview=Substr("body_raw", 1, 151))
+    pings = list(pq[:page_limit])
 
     # Optimization: the template will access Ping.duration, which would generate a
     # SQL query per displayed ping. Since we've already fetched a list of pings,
     # for some of them we can calculate durations more efficiently, without causing
     # additional SQL queries:
-    starts, num_misses = {}, 0
+    starts: dict[UUID | None, datetime | None] = {}
+    num_misses = 0
     for ping in reversed(pings):
         if ping.kind == "start":
             starts[ping.rid] = ping.created
@@ -792,9 +934,10 @@ def _get_events(check, page_limit, start=None, end=None):
                 num_misses += 1
             else:
                 ping.duration = None
-                if starts[ping.rid]:
-                    if ping.created - starts[ping.rid] < MAX_DURATION:
-                        ping.duration = ping.created - starts[ping.rid]
+                matching_start = starts[ping.rid]
+                if matching_start is not None:
+                    if ping.created - matching_start < MAX_DURATION:
+                        ping.duration = ping.created - matching_start
 
             starts[ping.rid] = None
 
@@ -804,88 +947,87 @@ def _get_events(check, page_limit, start=None, end=None):
         for ping in pings:
             ping.duration = None
 
-    alerts = Notification.objects.select_related("channel")
-    alerts = alerts.filter(owner=check, check_status="down")
-    if start and end:
-        alerts = alerts.filter(created__gte=start, created__lte=end)
-    elif len(pings):
-        cutoff = pings[-1].created
-        alerts = alerts.filter(created__gt=cutoff)
-    else:
-        alerts = []
+    alerts: list[Notification] = []
+    if kinds and "notification" in kinds:
+        aq = check.notification_set.order_by("-created")
+        aq = aq.filter(created__gte=start, created__lte=end, check_status="down")
+        aq = aq.select_related("channel")
+        alerts = list(aq[:page_limit])
 
-    events = pings + list(alerts)
-    events.sort(key=lambda el: el.created, reverse=True)
-    return events
+    flips: list[Flip] = []
+    if kinds is None or "flip" in kinds:
+        fq = check.flip_set.order_by("-created")
+        fq = fq.filter(created__gte=start, created__lte=end)
+        flips = list(fq[:page_limit])
+
+    events = pings + alerts + flips
+    # Sort events by the timestamp.
+    # If timestamps are equal, put flips chronologically after pings
+    events.sort(key=lambda el: (el.created, isinstance(el, Flip)), reverse=True)
+    return events[:page_limit]
 
 
 @login_required
-def log(request, code):
+def log(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check, rw = _get_check_for_user(request, code, preload_owner_profile=True)
 
+    smin = check.created
     smax = now()
-    smin = smax - td(hours=24)
-
     oldest_ping = check.visible_pings.order_by("n").first()
     if oldest_ping:
-        smin = min(smin, oldest_ping.created)
+        smin = max(smin, oldest_ping.created)
 
-    # Align slider steps to full hours
-    smin = smin.replace(minute=0, second=0)
-
-    form = forms.SeekForm(request.GET)
-    if form.is_valid():
-        start = form.cleaned_data["start"]
-        end = form.cleaned_data["end"]
-    else:
-        start, end = smin, smax
-
-    # Clamp the _get_events start argument to the date of the oldest visible ping
-    get_events_start = start
-    if oldest_ping and oldest_ping.created > get_events_start:
-        get_events_start = oldest_ping.created
-
-    total = check.visible_pings.filter(created__gte=start, created__lte=end).count()
-    events = _get_events(check, 1000, start=get_events_start, end=end)
+    events = _get_events(check, 1000, start=smin, end=smax)
     ctx = {
         "page": "log",
         "project": check.project,
         "check": check,
         "min": smin,
         "max": smax,
-        "start": start,
-        "end": end,
         "events": events,
-        "num_total": total,
+        "oldest_ping": oldest_ping,
     }
+
+    if events:
+        # A full precision timestamp of the most recent event.
+        # This will be used client-side for fetching live updates to specify
+        # "return any events after *this* point".
+        ctx["last_event_timestamp"] = events[0].created.timestamp()
 
     return render(request, "front/log.html", ctx)
 
 
 @login_required
-def details(request, code):
-    _refresh_last_active_date(request.profile)
+def details(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+    _refresh_last_active_date(request)
     check, rw = _get_check_for_user(request, code, preload_owner_profile=True)
 
     if request.GET.get("urls") in ("uuid", "slug") and rw:
         check.project.show_slugs = request.GET["urls"] == "slug"
         check.project.save()
 
-    channels = Channel.objects.filter(project=check.project)
-    channels = list(channels.order_by("created"))
+    all_channels = check.project.channel_set.order_by("created")
+    regular_channels: list[Channel] = []
+    group_channels: list[Channel] = []
+    for channel in all_channels:
+        channels = group_channels if channel.kind == "group" else regular_channels
+        channels.append(channel)
 
     all_tags = set()
-    q = Check.objects.filter(project=check.project).exclude(tags="")
-    for tags in q.values_list("tags", flat=True):
-        all_tags.update(tags.split(" "))
+    sibling_checks = Check.objects.filter(project=check.project).only("tags", "tz")
+    for sibling in sibling_checks:
+        if sibling.tags:
+            all_tags.update(sibling.tags.split(" "))
 
     ctx = {
         "page": "details",
         "project": check.project,
         "check": check,
         "rw": rw,
-        "channels": channels,
+        "channels": regular_channels,
+        "group_channels": group_channels,
         "enabled_channels": list(check.channel_set.all()),
+        "common_timezones": _common_timezones(sibling_checks),
         "timezones": all_timezones,
         "downtimes": check.downtimes(3, request.profile.tz),
         "tz": request.profile.tz,
@@ -897,7 +1039,7 @@ def details(request, code):
 
 
 @login_required
-def uncloak(request, unique_key):
+def uncloak(request: AuthenticatedHttpRequest, unique_key: str) -> HttpResponse:
     for check in request.profile.checks_from_all_projects().only("code"):
         if check.unique_key == unique_key:
             return redirect("hc-details", check.code)
@@ -906,7 +1048,7 @@ def uncloak(request, unique_key):
 
 
 @login_required
-def transfer(request: HttpRequest, code: UUID) -> HttpResponse:
+def transfer(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     if request.method == "POST":
@@ -932,7 +1074,7 @@ def transfer(request: HttpRequest, code: UUID) -> HttpResponse:
 
 @require_POST
 @login_required
-def copy(request, code):
+def copy(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check = _get_rw_check_for_user(request, code)
 
     if check.project.num_checks_available() <= 0:
@@ -972,12 +1114,16 @@ def copy(request, code):
     return redirect(url + "?copied")
 
 
-@login_required
-def status_single(request, code):
+def status_single(request: HttpRequest, code: UUID) -> HttpResponse:
+    if not request.user.is_authenticated:
+        return HttpResponseForbidden()
+
+    # We now know user is logged, tell the type checker request.profile exists-
+    request = cast(AuthenticatedHttpRequest, request)
     check, rw = _get_check_for_user(request, code, preload_owner_profile=True)
 
     status = check.get_status()
-    events = _get_events(check, 20)
+    events = _get_events(check, 30, start=check.created, end=now())
     updated = "1"
     if len(events):
         updated = str(events[0].created.timestamp())
@@ -1001,52 +1147,66 @@ def status_single(request, code):
 
 
 @login_required
-def badges(request, code):
+def badges(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project, rw = _get_project_for_user(request, code)
 
+    if request.method == "POST":
+        form = forms.BadgeSettingsForm(request.POST)
+        if not form.is_valid():
+            return HttpResponseBadRequest()
+
+        fmt = form.cleaned_data["fmt"]
+        states = form.cleaned_data["states"]
+        with_late = True if states == "3" else False
+        if form.cleaned_data["target"] == "all":
+            label = settings.MASTER_BADGE_LABEL
+            url = get_badge_url(project.badge_key, "*", fmt, with_late)
+        elif form.cleaned_data["target"] == "tag":
+            label = form.cleaned_data["tag"]
+            url = get_badge_url(project.badge_key, label, fmt, with_late)
+        elif form.cleaned_data["target"] == "check":
+            check = project.check_set.get(code=form.cleaned_data["check"])
+            url = absolute_reverse(
+                "hc-badge-check", args=[states, check.badge_key, fmt]
+            )
+            label = check.name_then_code()
+
+        if fmt == "shields":
+            url = "https://img.shields.io/endpoint?" + urlencode({"url": url})
+
+        ctx = {"fmt": fmt, "label": label, "url": url}
+        return render(request, "front/badges_preview.html", ctx)
+
+    checks = list(project.check_set.order_by("name"))
     tags = set()
-    for check in Check.objects.filter(project=project):
+    for check in checks:
         tags.update(check.tags_list())
 
     sorted_tags = sorted(tags, key=lambda s: s.lower())
-    sorted_tags.append("*")  # For the "overall status" badge
-
-    key = project.badge_key
-    urls = []
-    for tag in sorted_tags:
-        urls.append(
-            {
-                "tag": tag,
-                "svg": get_badge_url(key, tag),
-                "svg3": get_badge_url(key, tag, with_late=True),
-                "json": get_badge_url(key, tag, fmt="json"),
-                "json3": get_badge_url(key, tag, fmt="json", with_late=True),
-                "shields": get_badge_url(key, tag, fmt="shields"),
-                "shields3": get_badge_url(key, tag, fmt="shields", with_late=True),
-            }
-        )
 
     ctx = {
-        "have_tags": len(urls) > 1,
-        "page": "badges",
         "project": project,
-        "badges": urls,
+        "page": "badges",
+        "checks": checks,
+        "tags": sorted_tags,
+        "fmt": "svg",
+        "label": settings.MASTER_BADGE_LABEL,
+        "url": get_badge_url(project.badge_key, "*"),
     }
-
     return render(request, "front/badges.html", ctx)
 
 
 @login_required
-def channels(request, code):
+def channels(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project, rw = _get_project_for_user(request, code)
 
     if request.method == "POST":
         if not rw:
             return HttpResponseForbidden()
 
-        code = request.POST["channel"]
+        channel_code = request.POST["channel"]
         try:
-            channel = Channel.objects.get(code=code)
+            channel = Channel.objects.get(code=channel_code)
         except Channel.DoesNotExist:
             return HttpResponseBadRequest()
         if channel.project_id != project.id:
@@ -1055,9 +1215,9 @@ def channels(request, code):
         new_checks = []
         for key in request.POST:
             if key.startswith("check-"):
-                code = key[6:]
+                check_code = key[6:]
                 try:
-                    check = Check.objects.get(code=code)
+                    check = Check.objects.get(code=check_code)
                 except Check.DoesNotExist:
                     return HttpResponseBadRequest()
                 if check.project_id != project.id:
@@ -1067,9 +1227,10 @@ def channels(request, code):
         channel.checks.set(new_checks)
         return redirect("hc-channels", project.code)
 
-    channels = Channel.objects.filter(project=project)
-    channels = channels.order_by("created")
-    channels = channels.annotate(n_checks=Count("checks"))
+    channels = project.channel_set.annotate(n_checks=Count("checks"))
+    # Sort groups first, then in the creation order
+    channels = channels.annotate(is_group=Case(When(kind="group", then=0), default=1))
+    channels = channels.order_by("is_group", "created")
 
     ctx = {
         "page": "channels",
@@ -1080,7 +1241,6 @@ def channels(request, code):
         "enable_apprise": settings.APPRISE_ENABLED is True,
         "enable_call": bool(settings.TWILIO_AUTH),
         "enable_discord": bool(settings.DISCORD_CLIENT_ID),
-        "enable_linenotify": bool(settings.LINENOTIFY_CLIENT_ID),
         "enable_matrix": bool(settings.MATRIX_ACCESS_TOKEN),
         "enable_mattermost": settings.MATTERMOST_ENABLED is True,
         "enable_msteams": settings.MSTEAMS_ENABLED is True,
@@ -1110,12 +1270,11 @@ def channels(request, code):
 
 
 @login_required
-def channel_checks(request, code):
+def channel_checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     channel = _get_rw_channel_for_user(request, code)
 
     assigned = set(channel.checks.values_list("code", flat=True).distinct())
-    checks = Check.objects.filter(project=channel.project).order_by("created")
-
+    checks = channel.project.check_set.order_by("created")
     ctx = {"checks": checks, "assigned": assigned, "channel": channel}
 
     return render(request, "front/channel_checks.html", ctx)
@@ -1123,7 +1282,7 @@ def channel_checks(request, code):
 
 @require_POST
 @login_required
-def update_channel_name(request, code):
+def update_channel_name(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     channel = _get_rw_channel_for_user(request, code)
 
     form = forms.ChannelNameForm(request.POST)
@@ -1134,7 +1293,7 @@ def update_channel_name(request, code):
     return redirect("hc-channels", channel.project.code)
 
 
-def verify_email(request, code, token):
+def verify_email(request: HttpRequest, code: UUID, token: str) -> HttpResponse:
     channel = get_object_or_404(Channel, code=code)
     if channel.make_token() == token:
         channel.email_verified = True
@@ -1145,7 +1304,9 @@ def verify_email(request, code, token):
 
 
 @csrf_exempt
-def unsubscribe_email(request, code, signed_token):
+def unsubscribe_email(
+    request: HttpRequest, code: UUID, signed_token: str
+) -> HttpResponse:
     ctx = {}
 
     # Some email servers open links in emails to check for malicious content.
@@ -1179,23 +1340,31 @@ def unsubscribe_email(request, code, signed_token):
 
 @require_POST
 @login_required
-def send_test_notification(request: HttpRequest, code: UUID) -> HttpResponse:
+def send_test_notification(
+    request: AuthenticatedHttpRequest, code: UUID
+) -> HttpResponse:
     channel, rw = _get_channel_for_user(request, code)
 
     dummy = Check(name="TEST", status="down", project=channel.project)
     dummy.last_ping = now() - td(days=1)
     dummy.n_pings = 42
 
+    dummy_flip = Flip(owner=dummy)
+    dummy_flip.created = now()
+    dummy_flip.old_status = "up"
+    dummy_flip.new_status = "down"
+
     # Delete all older test notifications for this channel
     Notification.objects.filter(channel=channel, owner=None).delete()
 
     # Send the test notification
-    error = channel.notify(dummy, is_test=True)
+    error = channel.notify(dummy_flip, is_test=True)
 
     if error == "no-op":
         # This channel may be configured to send "up" notifications only.
-        dummy.status = "up"
-        error = channel.notify(dummy, is_test=True)
+        dummy_flip.old_status = "down"
+        dummy_flip.new_status = "up"
+        error = channel.notify(dummy_flip, is_test=True)
 
     if error:
         messages.warning(request, "Could not send a test notification. %s." % error)
@@ -1207,7 +1376,7 @@ def send_test_notification(request: HttpRequest, code: UUID) -> HttpResponse:
 
 @require_POST
 @login_required
-def remove_channel(request: HttpRequest, code: UUID) -> HttpResponse:
+def remove_channel(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     channel = _get_rw_channel_for_user(request, code)
     project = channel.project
     channel.delete()
@@ -1215,15 +1384,12 @@ def remove_channel(request: HttpRequest, code: UUID) -> HttpResponse:
     return redirect("hc-channels", project.code)
 
 
-def email_form(request: HttpRequest, channel: Channel) -> HttpResponse:
-    # Convince mypy we have User instead of AnonymousUser:
-    assert isinstance(request.user, User)
-
+def email_form(request: AuthenticatedHttpRequest, channel: Channel) -> HttpResponse:
     adding = channel._state.adding
     if request.method == "POST":
         form = forms.EmailForm(request.POST)
         if form.is_valid():
-            if channel.disabled or form.cleaned_data["value"] != channel.email_value:
+            if channel.disabled or form.cleaned_data["value"] != channel.email.value:
                 channel.disabled = False
 
                 if not settings.EMAIL_USE_VERIFICATION:
@@ -1252,9 +1418,9 @@ def email_form(request: HttpRequest, channel: Channel) -> HttpResponse:
     else:
         form = forms.EmailForm(
             {
-                "value": channel.email_value,
-                "up": channel.email_notify_up,
-                "down": channel.email_notify_down,
+                "value": channel.email.value,
+                "up": channel.email.notify_up,
+                "down": channel.email.notify_down,
             }
         )
 
@@ -1269,27 +1435,29 @@ def email_form(request: HttpRequest, channel: Channel) -> HttpResponse:
 
 
 @login_required
-def add_email(request: HttpRequest, code: UUID) -> HttpResponse:
+def add_email(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     channel = Channel(project=project, kind="email")
     return email_form(request, channel)
 
 
 @login_required
-def edit_channel(request: HttpRequest, code: UUID) -> HttpResponse:
+def edit_channel(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     channel = _get_rw_channel_for_user(request, code)
     if channel.kind == "email":
         return email_form(request, channel)
-    if channel.kind == "webhook":
+    elif channel.kind == "webhook":
         return webhook_form(request, channel)
-    if channel.kind == "sms":
+    elif channel.kind == "sms":
         return sms_form(request, channel)
-    if channel.kind == "signal":
+    elif channel.kind == "signal":
         return signal_form(request, channel)
-    if channel.kind == "whatsapp":
+    elif channel.kind == "whatsapp":
         return whatsapp_form(request, channel)
-    if channel.kind == "ntfy":
+    elif channel.kind == "ntfy":
         return ntfy_form(request, channel)
+    elif channel.kind == "group":
+        return group_form(request, channel)
 
     return HttpResponseBadRequest()
 
@@ -1312,7 +1480,7 @@ def webhook_form(request: HttpRequest, channel: Channel) -> HttpResponse:
         form = forms.WebhookForm()
     else:
 
-        def flatten(d):
+        def flatten(d: dict[str, str]) -> str:
             return "\n".join("%s: %s" % pair for pair in d.items())
 
         doc = json.loads(channel.value)
@@ -1332,7 +1500,7 @@ def webhook_form(request: HttpRequest, channel: Channel) -> HttpResponse:
 
 @require_setting("WEBHOOKS_ENABLED")
 @login_required
-def add_webhook(request: HttpRequest, code: UUID) -> HttpResponse:
+def add_webhook(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     channel = Channel(project=project, kind="webhook")
     return webhook_form(request, channel)
@@ -1340,7 +1508,7 @@ def add_webhook(request: HttpRequest, code: UUID) -> HttpResponse:
 
 @require_setting("SHELL_ENABLED")
 @login_required
-def add_shell(request, code):
+def add_shell(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     if request.method == "POST":
         form = forms.AddShellForm(request.POST)
@@ -1364,14 +1532,14 @@ def add_shell(request, code):
 
 @require_setting("PD_ENABLED")
 @login_required
-def add_pd(request, code):
+def add_pd(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     # Simple Install Flow
     if settings.PD_APP_ID:
         state = token_urlsafe()
 
-        redirect_url = settings.SITE_ROOT + reverse("hc-add-pd-complete")
+        redirect_url = absolute_reverse("hc-add-pd-complete")
         redirect_url += "?" + urlencode({"state": state})
 
         install_url = "https://app.pagerduty.com/install/integration?" + urlencode(
@@ -1401,7 +1569,7 @@ def add_pd(request, code):
 @require_setting("PD_ENABLED")
 @require_setting("PD_APP_ID")
 @login_required
-def add_pd_complete(request):
+def add_pd_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
     if "pagerduty" not in request.session:
         return HttpResponseBadRequest()
 
@@ -1428,14 +1596,14 @@ def add_pd_complete(request):
 
 @require_setting("PD_ENABLED")
 @require_setting("PD_APP_ID")
-def pd_help(request):
+def pd_help(request: HttpRequest) -> HttpResponse:
     ctx = {"page": "channels"}
     return render(request, "integrations/add_pd_simple.html", ctx)
 
 
 @require_setting("PAGERTREE_ENABLED")
 @login_required
-def add_pagertree(request, code):
+def add_pagertree(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -1456,7 +1624,7 @@ def add_pagertree(request, code):
 
 @require_setting("SLACK_ENABLED")
 @login_required
-def add_slack(request, code):
+def add_slack(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -1481,7 +1649,7 @@ def add_slack(request, code):
 
 @require_setting("SLACK_ENABLED")
 @require_setting("SLACK_CLIENT_ID")
-def slack_help(request):
+def slack_help(request: HttpRequest) -> HttpResponse:
     ctx = {"page": "channels"}
     return render(request, "integrations/add_slack_btn.html", ctx)
 
@@ -1489,7 +1657,7 @@ def slack_help(request):
 @require_setting("SLACK_ENABLED")
 @require_setting("SLACK_CLIENT_ID")
 @login_required
-def add_slack_btn(request, code):
+def add_slack_btn(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     state = token_urlsafe()
@@ -1514,7 +1682,7 @@ def add_slack_btn(request, code):
 @require_setting("SLACK_ENABLED")
 @require_setting("SLACK_CLIENT_ID")
 @login_required
-def add_slack_complete(request: HttpRequest) -> HttpResponse:
+def add_slack_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
     if "add_slack" not in request.session:
         return HttpResponseForbidden()
 
@@ -1536,27 +1704,33 @@ def add_slack_complete(request: HttpRequest) -> HttpResponse:
     result = curl.post("https://slack.com/api/oauth.v2.access", data)
 
     doc = result.json()
-    if doc.get("ok"):
-        channel = Channel(kind="slack", project=project)
-        channel.value = result.text
-        channel.save()
-        channel.assign_all_checks()
-        messages.success(request, "The Slack integration has been added!")
-    else:
-        s = doc.get("error")
-        messages.warning(request, "Error message from slack: %s" % s)
+    if not isinstance(doc, dict) or not doc.get("ok"):
+        messages.warning(
+            request,
+            "Received an unexpected response from Slack. Integration not added.",
+        )
+        logger.warning("Unexpected Slack OAuth response: %s", result.content)
+        return redirect("hc-channels", project.code)
 
+    channel = Channel(kind="slack", project=project)
+    channel.value = result.text
+    if channel.slack_channel:
+        channel.name = channel.slack_channel
+    channel.save()
+    channel.assign_all_checks()
+
+    messages.success(request, "Success, integration added!")
     return redirect("hc-channels", project.code)
 
 
 @require_setting("MATTERMOST_ENABLED")
-def mattermost_help(request):
+def mattermost_help(request: HttpRequest) -> HttpResponse:
     return render(request, "integrations/add_mattermost.html")
 
 
 @require_setting("MATTERMOST_ENABLED")
 @login_required
-def add_mattermost(request, code):
+def add_mattermost(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -1576,13 +1750,13 @@ def add_mattermost(request, code):
 
 
 @require_setting("ROCKETCHAT_ENABLED")
-def rocketchat_help(request):
+def rocketchat_help(request: HttpRequest) -> HttpResponse:
     return render(request, "integrations/add_rocketchat.html")
 
 
 @require_setting("ROCKETCHAT_ENABLED")
 @login_required
-def add_rocketchat(request, code):
+def add_rocketchat(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -1603,14 +1777,14 @@ def add_rocketchat(request, code):
 
 @require_setting("PUSHBULLET_CLIENT_ID")
 @login_required
-def add_pushbullet(request, code):
+def add_pushbullet(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     state = token_urlsafe()
     authorize_url = "https://www.pushbullet.com/authorize?" + urlencode(
         {
             "client_id": settings.PUSHBULLET_CLIENT_ID,
-            "redirect_uri": settings.SITE_ROOT + reverse(add_pushbullet_complete),
+            "redirect_uri": absolute_reverse(add_pushbullet_complete),
             "response_type": "code",
             "state": state,
         }
@@ -1626,9 +1800,13 @@ def add_pushbullet(request, code):
     return render(request, "integrations/add_pushbullet.html", ctx)
 
 
+class PushbulletOAuthResponse(BaseModel):
+    access_token: str
+
+
 @require_setting("PUSHBULLET_CLIENT_ID")
 @login_required
-def add_pushbullet_complete(request):
+def add_pushbullet_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
     if "add_pushbullet" not in request.session:
         return HttpResponseForbidden()
 
@@ -1650,30 +1828,34 @@ def add_pushbullet_complete(request):
         "grant_type": "authorization_code",
     }
     result = curl.post("https://api.pushbullet.com/oauth2/token", data)
+    try:
+        doc = PushbulletOAuthResponse.model_validate_json(result.content, strict=True)
+    except ValidationError:
+        logger.warning("Unexpected Pushbullet OAuth response: %s", result.content)
+        messages.warning(
+            request,
+            "Received an unexpected response from Pushbullet. Integration not added.",
+        )
+        return redirect("hc-channels", project.code)
 
-    doc = result.json()
-    if "access_token" in doc:
-        channel = Channel(kind="pushbullet", project=project)
-        channel.value = doc["access_token"]
-        channel.save()
-        channel.assign_all_checks()
-        messages.success(request, "The Pushbullet integration has been added!")
-    else:
-        messages.warning(request, "Something went wrong")
-
+    channel = Channel(kind="pushbullet", project=project)
+    channel.value = doc.access_token
+    channel.save()
+    channel.assign_all_checks()
+    messages.success(request, "The Pushbullet integration has been added!")
     return redirect("hc-channels", project.code)
 
 
 @require_setting("DISCORD_CLIENT_ID")
 @login_required
-def add_discord(request, code):
+def add_discord(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     state = token_urlsafe()
     auth_url = "https://discordapp.com/api/oauth2/authorize?" + urlencode(
         {
             "client_id": settings.DISCORD_CLIENT_ID,
             "scope": "webhook.incoming",
-            "redirect_uri": settings.SITE_ROOT + reverse(add_discord_complete),
+            "redirect_uri": absolute_reverse(add_discord_complete),
             "response_type": "code",
             "state": state,
         }
@@ -1687,7 +1869,7 @@ def add_discord(request, code):
 
 @require_setting("DISCORD_CLIENT_ID")
 @login_required
-def add_discord_complete(request):
+def add_discord_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
     if "add_discord" not in request.session:
         return HttpResponseForbidden()
 
@@ -1707,50 +1889,56 @@ def add_discord_complete(request):
         "client_secret": settings.DISCORD_CLIENT_SECRET,
         "code": request.GET.get("code"),
         "grant_type": "authorization_code",
-        "redirect_uri": settings.SITE_ROOT + reverse(add_discord_complete),
+        "redirect_uri": absolute_reverse(add_discord_complete),
     }
     result = curl.post("https://discordapp.com/api/oauth2/token", data)
 
     doc = result.json()
-    if "access_token" in doc:
-        channel = Channel(kind="discord", project=project)
-        channel.value = result.text
-        channel.save()
-        channel.assign_all_checks()
-        messages.success(request, "The Discord integration has been added!")
-    else:
-        messages.warning(request, "Something went wrong.")
+    if isinstance(doc, dict) and doc.get("code") == 30007:
+        e = "maximum number of webhooks reached"
+        messages.warning(request, f"Response from Discord: {e}. Integration not added.")
+        return redirect("hc-channels", project.code)
 
+    if not isinstance(doc, dict) or "access_token" not in doc:
+        messages.warning(
+            request,
+            "Received an unexpected response from Discord. Integration not added.",
+        )
+        logger.warning("Unexpected Discord OAuth response: %s", result.content)
+        return redirect("hc-channels", project.code)
+
+    channel = Channel(kind="discord", project=project)
+    channel.value = result.text
+    channel.save()
+    channel.assign_all_checks()
+    messages.success(request, "The Discord integration has been added!")
     return redirect("hc-channels", project.code)
 
 
 @require_setting("PUSHOVER_API_TOKEN")
-def pushover_help(request):
+def pushover_help(request: HttpRequest) -> HttpResponse:
     ctx = {"page": "channels"}
     return render(request, "integrations/add_pushover_help.html", ctx)
 
 
 @require_setting("PUSHOVER_API_TOKEN")
 @login_required
-def add_pushover(request, code):
+def add_pushover(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
-        state = token_urlsafe()
+        state = token_urlsafe().lower()
 
-        failure_url = settings.SITE_ROOT + reverse("hc-channels", args=[project.code])
-        success_url = (
-            settings.SITE_ROOT
-            + reverse("hc-add-pushover", args=[project.code])
-            + "?"
-            + urlencode(
-                {
-                    "state": state,
-                    "prio": request.POST.get("po_priority", "0"),
-                    "prio_up": request.POST.get("po_priority_up", "0"),
-                }
-            )
+        failure_url = absolute_reverse("hc-channels", args=[project.code])
+        success_url = absolute_reverse("hc-add-pushover", args=[project.code])
+        success_url += "?" + urlencode(
+            {
+                "state": state,
+                "prio": request.POST.get("po_priority", "0"),
+                "prio_up": request.POST.get("po_priority_up", "0"),
+            }
         )
+        assert settings.PUSHOVER_SUBSCRIPTION_URL
         subscription_url = (
             settings.PUSHOVER_SUBSCRIPTION_URL
             + "?"
@@ -1798,7 +1986,7 @@ def add_pushover(request, code):
 
 @require_setting("OPSGENIE_ENABLED")
 @login_required
-def add_opsgenie(request, code):
+def add_opsgenie(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -1820,7 +2008,7 @@ def add_opsgenie(request, code):
 
 @require_setting("VICTOROPS_ENABLED")
 @login_required
-def add_victorops(request, code):
+def add_victorops(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -1841,7 +2029,7 @@ def add_victorops(request, code):
 
 @require_setting("ZULIP_ENABLED")
 @login_required
-def add_zulip(request: HttpRequest, code: UUID) -> HttpResponse:
+def add_zulip(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -1860,34 +2048,54 @@ def add_zulip(request: HttpRequest, code: UUID) -> HttpResponse:
     return render(request, "integrations/add_zulip.html", ctx)
 
 
-@csrf_exempt
-@require_POST
-def telegram_bot(request):
-    try:
-        doc = json.loads(request.body.decode())
+class TelegramChat(BaseModel):
+    id: int
+    type: Literal["group", "private", "supergroup", "channel"]
+    title: str | None = None
+    username: str | None = None
+
+
+class TelegramMessage(BaseModel):
+    chat: TelegramChat
+    text: str
+    message_thread_id: int | None = None
+
+
+class TelegramCallback(BaseModel):
+    message: TelegramMessage
+
+    @classmethod
+    def load(self, data: bytes) -> TelegramCallback:
+        doc = json.loads(data.decode())
         if "channel_post" in doc:
             # Telegram's "channel_post" key uses the same structure as "message".
-            # To keep the JSON schema and the view logic simple, if the payload
+            # To keep the validation and view logic simple, if the payload
             # contains "channel_post", copy it to "message", and proceed as usual.
             doc["message"] = doc["channel_post"]
+        return TelegramCallback.model_validate(doc, strict=True)
 
-        jsonschema.validate(doc, telegram_callback)
-    except ValueError:
-        return HttpResponseBadRequest()
-    except jsonschema.ValidationError:
+
+@csrf_exempt
+@require_POST
+def telegram_bot(request: HttpRequest) -> HttpResponse:
+    try:
+        doc = TelegramCallback.load(request.body)
+    except ValidationError:
         # We don't recognize the message format, but don't want Telegram
         # retrying this over and over again, so respond with 200 OK
         return HttpResponse()
+    except ValueError:
+        return HttpResponseBadRequest()
 
-    if "/start" not in doc["message"]["text"]:
+    if "/start" not in doc.message.text:
         return HttpResponse()
 
-    chat = doc["message"]["chat"]
+    chat = doc.message.chat
     recipient = {
-        "id": chat["id"],
-        "type": chat["type"],
-        "name": chat.get("title") or chat.get("username"),
-        "thread_id": doc["message"].get("message_thread_id"),
+        "id": chat.id,
+        "type": chat.type,
+        "name": chat.title or chat.username,
+        "thread_id": doc.message.message_thread_id,
     }
 
     invite = render_to_string(
@@ -1896,7 +2104,7 @@ def telegram_bot(request):
     )
 
     try:
-        Telegram.send(recipient["id"], recipient["thread_id"], invite)
+        Telegram.send(chat.id, doc.message.message_thread_id, invite)
     except TransportError:
         # Swallow the error and return HTTP 200 OK, otherwise Telegram will
         # hit the webhook again and again.
@@ -1906,7 +2114,7 @@ def telegram_bot(request):
 
 
 @require_setting("TELEGRAM_TOKEN")
-def telegram_help(request):
+def telegram_help(request: HttpRequest) -> HttpResponse:
     ctx = {
         "page": "channels",
         "bot_name": settings.TELEGRAM_BOT_NAME,
@@ -1917,7 +2125,7 @@ def telegram_help(request):
 
 @require_setting("TELEGRAM_TOKEN")
 @login_required
-def add_telegram(request):
+def add_telegram(request: AuthenticatedHttpRequest) -> HttpResponse:
     recipient = None
     if qs := request.META["QUERY_STRING"]:
         try:
@@ -1969,9 +2177,9 @@ def sms_form(request: HttpRequest, channel: Channel) -> HttpResponse:
         form = forms.PhoneUpDownForm(
             {
                 "label": channel.name,
-                "phone": channel.phone_number,
-                "up": channel.sms_notify_up,
-                "down": channel.sms_notify_down,
+                "phone": channel.phone.value,
+                "up": channel.phone.notify_up,
+                "down": channel.phone.notify_down,
             }
         )
 
@@ -1987,7 +2195,7 @@ def sms_form(request: HttpRequest, channel: Channel) -> HttpResponse:
 
 @require_setting("TWILIO_AUTH")
 @login_required
-def add_sms(request: HttpRequest, code: UUID) -> HttpResponse:
+def add_sms(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     channel = Channel(project=project, kind="sms")
     return sms_form(request, channel)
@@ -1995,7 +2203,7 @@ def add_sms(request: HttpRequest, code: UUID) -> HttpResponse:
 
 @require_setting("TWILIO_AUTH")
 @login_required
-def add_call(request, code):
+def add_call(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     if request.method == "POST":
         form = forms.PhoneNumberForm(request.POST)
@@ -2038,9 +2246,9 @@ def whatsapp_form(request: HttpRequest, channel: Channel) -> HttpResponse:
         form = forms.PhoneUpDownForm(
             {
                 "label": channel.name,
-                "phone": channel.phone_number,
-                "up": channel.whatsapp_notify_up,
-                "down": channel.whatsapp_notify_down,
+                "phone": channel.phone.value,
+                "up": channel.phone.notify_up,
+                "down": channel.phone.notify_down,
             }
         )
 
@@ -2056,7 +2264,7 @@ def whatsapp_form(request: HttpRequest, channel: Channel) -> HttpResponse:
 
 @require_setting("TWILIO_USE_WHATSAPP")
 @login_required
-def add_whatsapp(request: HttpRequest, code: UUID) -> HttpResponse:
+def add_whatsapp(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     channel = Channel(project=project, kind="whatsapp")
     return whatsapp_form(request, channel)
@@ -2066,7 +2274,7 @@ def add_whatsapp(request: HttpRequest, code: UUID) -> HttpResponse:
 def signal_form(request: HttpRequest, channel: Channel) -> HttpResponse:
     adding = channel._state.adding
     if request.method == "POST":
-        form = forms.PhoneUpDownForm(request.POST)
+        form = forms.SignalForm(request.POST)
         if form.is_valid():
             channel.name = form.cleaned_data["label"]
             channel.value = form.get_json()
@@ -2076,14 +2284,14 @@ def signal_form(request: HttpRequest, channel: Channel) -> HttpResponse:
                 channel.assign_all_checks()
             return redirect("hc-channels", channel.project.code)
     elif adding:
-        form = forms.PhoneUpDownForm()
+        form = forms.SignalForm()
     else:
-        form = forms.PhoneUpDownForm(
+        form = forms.SignalForm(
             {
                 "label": channel.name,
-                "phone": channel.phone_number,
-                "up": channel.signal_notify_up,
-                "down": channel.signal_notify_down,
+                "recipient": channel.phone.value,
+                "up": channel.phone.notify_up,
+                "down": channel.phone.notify_down,
             }
         )
 
@@ -2098,7 +2306,7 @@ def signal_form(request: HttpRequest, channel: Channel) -> HttpResponse:
 
 @require_setting("SIGNAL_CLI_SOCKET")
 @login_required
-def add_signal(request: HttpRequest, code: UUID) -> HttpResponse:
+def add_signal(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     channel = Channel(project=project, kind="signal")
     return signal_form(request, channel)
@@ -2106,7 +2314,7 @@ def add_signal(request: HttpRequest, code: UUID) -> HttpResponse:
 
 @require_setting("TRELLO_APP_KEY")
 @login_required
-def add_trello(request, code):
+def add_trello(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     if request.method == "POST":
         form = forms.AddTrelloForm(request.POST)
@@ -2120,7 +2328,7 @@ def add_trello(request, code):
         channel.assign_all_checks()
         return redirect("hc-channels", project.code)
 
-    return_url = settings.SITE_ROOT + reverse("hc-add-trello", args=[project.code])
+    return_url = absolute_reverse("hc-add-trello", args=[project.code])
     authorize_url = "https://trello.com/1/authorize?" + urlencode(
         {
             "expiration": "never",
@@ -2143,7 +2351,7 @@ def add_trello(request, code):
 
 @require_setting("MATRIX_ACCESS_TOKEN")
 @login_required
-def add_matrix(request, code):
+def add_matrix(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     if request.method == "POST":
         form = forms.AddMatrixForm(request.POST)
@@ -2175,7 +2383,7 @@ def add_matrix(request, code):
 
 @require_setting("APPRISE_ENABLED")
 @login_required
-def add_apprise(request, code):
+def add_apprise(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -2195,13 +2403,28 @@ def add_apprise(request, code):
     return render(request, "integrations/add_apprise.html", ctx)
 
 
+class TrelloList(BaseModel):
+    id: str
+    name: str
+
+
+class TrelloBoard(BaseModel):
+    id: str
+    name: str
+    lists: list[TrelloList]
+
+
+TrelloBoards = TypeAdapter(list[TrelloBoard])
+
+
 @require_setting("TRELLO_APP_KEY")
 @login_required
 @require_POST
-def trello_settings(request):
-    token = request.POST.get("token")
+def trello_settings(request: AuthenticatedHttpRequest) -> HttpResponse:
+    token = request.POST.get("token", "")
 
     url = "https://api.trello.com/1/members/me/boards"
+    assert settings.TRELLO_APP_KEY
     params = {
         "key": settings.TRELLO_APP_KEY,
         "token": token,
@@ -2211,22 +2434,27 @@ def trello_settings(request):
         "list_fields": "id,name",
     }
 
-    boards = curl.get(url, params=params).json()
-    num_lists = sum(len(board["lists"]) for board in boards)
+    result = curl.get(url, params)
+    try:
+        boards = TrelloBoards.validate_json(result.content)
+    except ValidationError:
+        logger.warning("Unexpected Trello API response: %s", result.content)
+        return render(request, "integrations/trello_settings.html", {"error": 1})
 
+    num_lists = sum(len(board.lists) for board in boards)
     ctx = {"token": token, "boards": boards, "num_lists": num_lists}
     return render(request, "integrations/trello_settings.html", ctx)
 
 
 @require_setting("MSTEAMS_ENABLED")
 @login_required
-def add_msteams(request, code):
+def add_msteams(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
         form = forms.AddUrlForm(request.POST)
         if form.is_valid():
-            channel = Channel(project=project, kind="msteams")
+            channel = Channel(project=project, kind="msteamsw")
             channel.value = form.cleaned_data["value"]
             channel.save()
 
@@ -2241,7 +2469,7 @@ def add_msteams(request, code):
 
 @require_setting("PROMETHEUS_ENABLED")
 @login_required
-def add_prometheus(request, code):
+def add_prometheus(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project, rw = _get_project_for_user(request, code)
     ctx = {
         "page": "channels",
@@ -2252,7 +2480,7 @@ def add_prometheus(request, code):
 
 
 @require_setting("PROMETHEUS_ENABLED")
-def metrics(request, code, key):
+def metrics(request: HttpRequest, code: UUID, key: str) -> HttpResponse:
     if len(key) != 32:
         return HttpResponseBadRequest()
 
@@ -2264,10 +2492,10 @@ def metrics(request, code, key):
 
     checks = Check.objects.filter(project_id=project.id).order_by("id")
 
-    def esc(s):
+    def esc(s: str) -> str:
         return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
-    def output(checks):
+    def output(checks: QuerySet[Check]) -> Iterable[str]:
         help = "Whether the check is currently up (1 for yes, 0 for no)."
         yield f"# HELP hc_check_up {help}\n"
         yield "# TYPE hc_check_up gauge\n"
@@ -2286,14 +2514,20 @@ def metrics(request, code, key):
             value = 1 if check.last_start is not None else 0
             yield TMPL % (esc(check.name), esc(check.tags), check.unique_key, value)
 
-        tags_statuses, num_down = _tags_statuses(checks)
+        all_tags, down_tags, num_down = set(), set(), 0
+        for check in checks:
+            all_tags.update(check.tags_list())
+            if check.get_status() == "down":
+                num_down += 1
+                down_tags.update(check.tags_list())
+
         yield "\n"
         help = "Whether all checks with this tag are up (1 for yes, 0 for no)."
         yield f"# HELP hc_tag_up {help}\n"
         yield "# TYPE hc_tag_up gauge\n"
         TMPL = """hc_tag_up{tag="%s"} %d\n"""
-        for tag in sorted(tags_statuses):
-            value = 0 if tags_statuses[tag] == "down" else 1
+        for tag in sorted(all_tags):
+            value = 0 if tag in down_tags else 1
             yield TMPL % (esc(tag), value)
 
         yield "\n"
@@ -2311,7 +2545,7 @@ def metrics(request, code, key):
 
 @require_setting("SPIKE_ENABLED")
 @login_required
-def add_spike(request, code):
+def add_spike(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -2330,83 +2564,8 @@ def add_spike(request, code):
     return render(request, "integrations/add_spike.html", ctx)
 
 
-@require_setting("LINENOTIFY_CLIENT_ID")
 @login_required
-def add_linenotify(request, code):
-    project = _get_rw_project_for_user(request, code)
-
-    state = token_urlsafe()
-    authorize_url = " https://notify-bot.line.me/oauth/authorize?" + urlencode(
-        {
-            "client_id": settings.LINENOTIFY_CLIENT_ID,
-            "redirect_uri": settings.SITE_ROOT + reverse(add_linenotify_complete),
-            "response_type": "code",
-            "state": state,
-            "scope": "notify",
-        }
-    )
-
-    ctx = {
-        "page": "channels",
-        "project": project,
-        "authorize_url": authorize_url,
-    }
-
-    request.session["add_linenotify"] = (state, str(project.code))
-    return render(request, "integrations/add_linenotify.html", ctx)
-
-
-@require_setting("LINENOTIFY_CLIENT_ID")
-@login_required
-def add_linenotify_complete(request):
-    if "add_linenotify" not in request.session:
-        return HttpResponseForbidden()
-
-    state, code_str = request.session.pop("add_linenotify")
-    code = UUID(code_str)
-    if request.GET.get("state") != state:
-        return HttpResponseForbidden()
-
-    project = _get_rw_project_for_user(request, code)
-    if request.GET.get("error") == "access_denied":
-        messages.warning(request, "LINE Notify setup was cancelled.")
-        return redirect("hc-channels", project.code)
-
-    # Exchange code for access token
-    data = {
-        "grant_type": "authorization_code",
-        "code": request.GET.get("code"),
-        "redirect_uri": settings.SITE_ROOT + reverse(add_linenotify_complete),
-        "client_id": settings.LINENOTIFY_CLIENT_ID,
-        "client_secret": settings.LINENOTIFY_CLIENT_SECRET,
-    }
-    result = curl.post("https://notify-bot.line.me/oauth/token", data)
-
-    doc = result.json()
-    if doc.get("status") != 200:
-        messages.warning(request, "Something went wrong.")
-        return redirect("hc-channels", project.code)
-
-    # Fetch notification target's name, will use it as channel name:
-    token = doc["access_token"]
-    result = curl.get(
-        "https://notify-api.line.me/api/status",
-        headers={"Authorization": "Bearer %s" % token},
-    )
-    doc = result.json()
-
-    channel = Channel(kind="linenotify", project=project)
-    channel.name = doc.get("target")
-    channel.value = token
-    channel.save()
-    channel.assign_all_checks()
-    messages.success(request, "The LINE Notify integration has been added!")
-
-    return redirect("hc-channels", project.code)
-
-
-@login_required
-def add_gotify(request, code):
+def add_gotify(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
 
     if request.method == "POST":
@@ -2425,6 +2584,38 @@ def add_gotify(request, code):
     return render(request, "integrations/add_gotify.html", ctx)
 
 
+def group_form(request: HttpRequest, channel: Channel) -> HttpResponse:
+    adding = channel._state.adding
+    if request.method == "POST":
+        form = forms.GroupForm(request.POST, project=channel.project)
+        if form.is_valid():
+            channel.name = form.cleaned_data["label"]
+            channel.value = form.get_value()
+            channel.save()
+
+            if adding:
+                channel.assign_all_checks()
+            return redirect("hc-channels", channel.project.code)
+    elif adding:
+        form = forms.GroupForm(project=channel.project)
+    else:
+        # Filter out unavailable channels
+        channels = list(channel.group_channels.values_list("code", flat=True))
+        form = forms.GroupForm(
+            {"channels": channels, "label": channel.name}, project=channel.project
+        )
+
+    ctx = {"page": "channels", "project": channel.project, "form": form}
+    return render(request, "integrations/group_form.html", ctx)
+
+
+@login_required
+def add_group(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+    project = _get_rw_project_for_user(request, code)
+    channel = Channel(project=project, kind="group")
+    return group_form(request, channel)
+
+
 def ntfy_form(request: HttpRequest, channel: Channel) -> HttpResponse:
     adding = channel._state.adding
     if request.method == "POST":
@@ -2441,10 +2632,11 @@ def ntfy_form(request: HttpRequest, channel: Channel) -> HttpResponse:
     else:
         form = forms.NtfyForm(
             {
-                "topic": channel.ntfy_topic,
-                "url": channel.ntfy_url,
-                "priority": channel.ntfy_priority,
-                "priority_up": channel.ntfy_priority_up,
+                "topic": channel.ntfy.topic,
+                "url": channel.ntfy.url,
+                "priority": channel.ntfy.priority,
+                "priority_up": channel.ntfy.priority_up,
+                "token": channel.ntfy.token,
             }
         )
 
@@ -2453,7 +2645,7 @@ def ntfy_form(request: HttpRequest, channel: Channel) -> HttpResponse:
 
 
 @login_required
-def add_ntfy(request: HttpRequest, code: UUID) -> HttpResponse:
+def add_ntfy(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project = _get_rw_project_for_user(request, code)
     channel = Channel(project=project, kind="ntfy")
     return ntfy_form(request, channel)
@@ -2461,7 +2653,7 @@ def add_ntfy(request: HttpRequest, code: UUID) -> HttpResponse:
 
 @require_setting("SIGNAL_CLI_SOCKET")
 @login_required
-def signal_captcha(request: HttpRequest) -> HttpResponse:
+def signal_captcha(request: AuthenticatedHttpRequest) -> HttpResponse:
     if not request.user.is_superuser:
         return HttpResponseForbidden()
 
@@ -2480,7 +2672,7 @@ def signal_captcha(request: HttpRequest) -> HttpResponse:
         }
 
         payload_bytes = (json.dumps(payload) + "\n").encode()
-        for reply_bytes in Signal(None)._read_replies(payload_bytes):
+        for reply_bytes in Signal._read_replies(payload_bytes):
             try:
                 reply = json.loads(reply_bytes.decode())
             except ValueError:
@@ -2497,7 +2689,7 @@ def signal_captcha(request: HttpRequest) -> HttpResponse:
 @require_setting("SIGNAL_CLI_SOCKET")
 @login_required
 @require_POST
-def verify_signal_number(request: HttpRequest) -> HttpResponse:
+def verify_signal_number(request: AuthenticatedHttpRequest) -> HttpResponse:
     def render_result(result: str | None) -> HttpResponse:
         return render(request, "integrations/signal_result.html", {"result": result})
 
@@ -2505,22 +2697,59 @@ def verify_signal_number(request: HttpRequest) -> HttpResponse:
     if not TokenBucket.authorize_signal_verification(request.user):
         return render_result("Verification rate limit exceeded")
 
-    form = forms.PhoneNumberForm(request.POST)
+    form = forms.SignalRecipientForm(request.POST)
     if not form.is_valid():
         return render_result("Invalid phone number")
 
-    phone = form.cleaned_data["phone"]
+    recipient = form.cleaned_data["recipient"]
     # Enforce per-recipient rate limit (6 messages per minute)
-    if not TokenBucket.authorize_signal(phone):
+    if not TokenBucket.authorize_signal(recipient):
         return render_result("Verification rate limit exceeded")
 
     try:
-        Signal(None).send(phone, f"Test message from {settings.SITE_NAME}")
+        Signal.send(recipient, f"Test message from {settings.SITE_NAME}")
+    except SignalRateLimitFailure as e:
+        Channel().send_signal_captcha_alert(e.token, e.reply.decode())
+        return render_result(e.message)
     except TransportError as e:
         return render_result(e.message)
 
     # Success!
     return render_result(None)
+
+
+def log_events(request: HttpRequest, code: UUID) -> HttpResponse:
+    if not request.user.is_authenticated:
+        return HttpResponseForbidden()
+
+    check, rw = _get_check_for_user(request, code, preload_owner_profile=True)
+    form = forms.LogFiltersForm(request.GET)
+    if not form.is_valid():
+        return HttpResponseBadRequest()
+
+    if form.cleaned_data["u"]:
+        # We are live-loading more events
+        start = form.cleaned_data["u"] + td(microseconds=1)
+        end = now()
+    else:
+        # We're applying new filters
+        start = check.created
+        end = form.cleaned_data["end"] or now()
+
+    # clamp start to the date of the oldest visible ping
+    oldest_ping = check.visible_pings.order_by("n").first()
+    if oldest_ping:
+        start = max(start, oldest_ping.created)
+
+    events = _get_events(check, 1000, start=start, end=end, kinds=form.kinds())
+    response = render(request, "front/log_rows.html", {"events": events})
+
+    if events:
+        # Include a full precision timestamp of the most recent event in a
+        # response header. This will be used client-side for fetching live updates
+        # to specify "return any events after *this* point".
+        response["X-Last-Event-Timestamp"] = str(events[0].created.timestamp())
+    return response
 
 
 # Forks: add custom views after this line

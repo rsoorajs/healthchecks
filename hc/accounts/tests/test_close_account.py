@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from unittest.mock import patch
-
 from django.contrib.auth.models import User
 
 from hc.api.models import Check
@@ -10,13 +8,13 @@ from hc.test import BaseTestCase
 
 
 class CloseAccountTestCase(BaseTestCase):
-    def test_it_requires_sudo_mode(self):
+    def test_it_requires_sudo_mode(self) -> None:
         self.client.login(username="alice@example.org", password="password")
 
         r = self.client.get("/accounts/close/")
         self.assertContains(r, "We have sent a confirmation code")
 
-    def test_it_shows_confirmation_form(self):
+    def test_it_shows_confirmation_form(self) -> None:
         self.client.login(username="alice@example.org", password="password")
         self.set_sudo_flag()
 
@@ -25,8 +23,7 @@ class CloseAccountTestCase(BaseTestCase):
         self.assertContains(r, "1 project")
         self.assertContains(r, "0 checks")
 
-    @patch("hc.payments.models.braintree")
-    def test_it_works(self, mock_braintree):
+    def test_it_works(self) -> None:
         Check.objects.create(project=self.project, tags="foo a-B_1  baz@")
         Subscription.objects.create(
             user=self.alice, subscription_id="123", customer_id="fake-customer-id"
@@ -36,8 +33,9 @@ class CloseAccountTestCase(BaseTestCase):
         self.set_sudo_flag()
 
         payload = {"confirmation": "alice@example.org"}
-        r = self.client.post("/accounts/close/", payload)
+        r = self.client.post("/accounts/close/", payload, follow=True)
         self.assertRedirects(r, "/accounts/login/")
+        self.assertContains(r, "Account closed.")
 
         # Alice should be gone
         alices = User.objects.filter(username="alice")
@@ -46,13 +44,10 @@ class CloseAccountTestCase(BaseTestCase):
         # Check should be gone
         self.assertFalse(Check.objects.exists())
 
-        # Subscription should have been canceled
-        mock_braintree.Subscription.cancel.assert_called_once()
-
         # Subscription should be gone
         self.assertFalse(Subscription.objects.exists())
 
-    def test_it_requires_confirmation(self):
+    def test_it_requires_confirmation(self) -> None:
         self.client.login(username="alice@example.org", password="password")
         self.set_sudo_flag()
 
@@ -65,7 +60,7 @@ class CloseAccountTestCase(BaseTestCase):
         self.alice.refresh_from_db()
         self.profile.refresh_from_db()
 
-    def test_partner_removal_works(self):
+    def test_partner_removal_works(self) -> None:
         self.client.login(username="bob@example.org", password="password")
         self.set_sudo_flag()
 

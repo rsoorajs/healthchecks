@@ -1,4 +1,7 @@
 $(function () {
+    var base = document.getElementById("base-url").getAttribute("href").slice(0, -1);
+    var favicon = document.querySelector('link[rel="icon"]');
+
     $("#edit-name").click(function() {
         $('#update-name-modal').modal("show");
         $("#update-name-input").focus();
@@ -62,7 +65,7 @@ $(function () {
         }, 300);
     });
 
-    $("#details-integrations.rw tr").click(function() {
+    $(".details-integrations.rw tr").click(function() {
         var isOn = $(this).toggleClass("on").hasClass("on");
         $(".label", this).text(isOn ? "ON" : "OFF");
 
@@ -92,7 +95,7 @@ $(function () {
                     $("#current-status-icon").attr("class", "status ic-" + data.status);
                     $("#current-status-text").html(data.status_text);
 
-                    $('#pause-btn').prop('disabled', data.status == "paused");
+                    $('#pause-btn').prop('disabled', data.status == "paused" && !data.started);
                 }
 
                 if (data.started != lastStarted) {
@@ -112,6 +115,8 @@ $(function () {
 
                 if (document.title != data.title) {
                     document.title = data.title;
+                    var downPostfix = data.status == "down" ? "_down" : "";
+                    favicon.href = `${base}/static/img/favicon${downPostfix}.svg`;
                 }
             }
         });
@@ -138,12 +143,17 @@ $(function () {
 
     function switchDateFormat(format) {
         lastFormat = format;
+        var currentYear = moment().year();
 
         document.querySelectorAll("#log tr").forEach(function(row) {
             var dt = moment.unix(row.dataset.dt).utc();
             format == "local" ? dt.local() : dt.tz(format);
+            var dateFormat = "MMM D";
+            if (dt.year() != currentYear) {
+                dateFormat = "MMM D, YYYY";
+            }
 
-            row.children[1].textContent = dt.format("MMM D");
+            row.children[1].textContent = dt.format(dateFormat);
             row.children[2].textContent = dt.format("HH:mm");
         })
 

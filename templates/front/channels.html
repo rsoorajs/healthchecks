@@ -32,85 +32,14 @@
             </td>
             <td>
                 <div class="edit-name" data-toggle="modal" data-target="#name-{{ ch.code }}">
-                     {% if ch.name %}
-                     {{ ch.name }}
-                     {% else %}
-                     <div class="unnamed">unnamed</div>
-                     {% endif %}
-                     <div class="channel-details-mini">
-                        {% if ch.kind == "email" %}
-                            Email to <span>{{ ch.email_value }}</span>
-                            {% if ch.email_notify_down and not ch.email_notify_up %}
-                                (down only)
-                            {% endif %}
-                            {% if ch.email_notify_up and not ch.email_notify_down %}
-                                (up only)
-                            {% endif %}
-                        {% elif ch.kind == "pd" %}
-                            PagerDuty account <span>{{ ch.pd_account }}</span>
-                        {% elif ch.kind == "po" %}
-                            Pushover ({{ ch.po_priority }} priority)
-                        {% elif ch.kind == "slack" %}
-                            Slack
-                            {% if ch.slack_team %}
-                                team <span>{{ ch.slack_team }}</span>,
-                                channel <span>{{ ch.slack_channel }}</span>
-                            {% endif %}
-                        {% elif ch.kind == "telegram" %}
-                            Telegram
-                            {% if ch.telegram_type == "group" %}
-                                group <span>{{ ch.telegram_name }}</span>
-                            {% elif ch.telegram_type == "private" %}
-                                user <span>{{ ch.telegram_name }}</span>
-                            {% elif ch.telegram_type == "channel" %}
-                                channel <span>{{ ch.telegram_name }}</span>
-                            {% endif %}
-                        {% elif ch.kind == "sms" %}
-                            SMS to <span>{{ ch.phone_number }}</span>
-                            {% if ch.sms_notify_down and not ch.sms_notify_up %}
-                                (down only)
-                            {% endif %}
-                            {% if ch.sms_notify_up and not ch.sms_notify_down %}
-                                (up only)
-                            {% endif %}
-                        {% elif ch.kind == "call" %}
-                            Phone call to <span>{{ ch.phone_number }}</span>
-                        {% elif ch.kind == "trello" %}
-                            Trello
-                            board <span>{{ ch.trello_board_list|first }}</span>,
-                            list <span>{{ ch.trello_board_list|last }}</span>
-                        {% elif ch.kind == "matrix" %}
-                            Matrix <span>{{ ch.value }}</span>
-                        {% elif ch.kind == "whatsapp" %}
-                            WhatsApp to <span>{{ ch.phone_number }}</span>
-                            {% if ch.whatsapp_notify_down and not ch.whatsapp_notify_up %}
-                                (down only)
-                            {% endif %}
-                            {% if ch.whatsapp_notify_up and not ch.whatsapp_notify_down %}
-                                (up only)
-                            {% endif %}
-                        {% elif ch.kind == "zulip" %}
-                            Zulip
-                            {% if ch.zulip_type == "stream" %}
-                            stream <span>{{ ch.zulip_to}}</span>
-                            {% elif ch.zulip_type == "private" %}
-                            user <span>{{ ch.zulip_to}}</span>
-                            {% endif %}
-                        {% elif ch.kind == "signal" %}
-                            Signal to <span>{{ ch.phone_number }}</span>
-                            {% if ch.signal_notify_down and not ch.signal_notify_up %}
-                                (down only)
-                            {% endif %}
-                            {% if ch.signal_notify_up and not ch.signal_notify_down %}
-                                (up only)
-                            {% endif %}
-                        {% elif ch.kind == "ntfy" %}
-                            ntfy topic <span>{{ ch.ntfy_topic }}</span>,
-                            {{ ch.ntfy_priority_display }} priority
-                        {% else %}
-                            {{ ch.get_kind_display }}
-                        {% endif %}
-                     </div>
+                    {% if ch.name %}
+                    {{ ch.name }}
+                    {% else %}
+                    <div class="unnamed">unnamed</div>
+                    {% endif %}
+                    <div class="channel-details-mini">
+                    {% include "front/channel_description.html" with ch=ch %}
+                    </div>
                 </div>
             </td>
             <td>
@@ -194,21 +123,6 @@
     {% if rw %}
     <h1 class="ai-title">Add More</h1>
     <ul class="add-integration">
-        {% if enable_slack %}
-        <li>
-            <img src="{% static 'img/integrations/slack.png' %}"
-                class="icon" alt="Slack icon" />
-
-            <h2>Slack</h2>
-            <p>A messaging app for teams.</p>
-            {% if enable_slack_btn %}
-            <a href="{% url 'hc-add-slack-btn' project.code %}" class="btn btn-primary">Add Integration</a>
-            {% else %}
-            <a href="{% url 'hc-add-slack' project.code %}" class="btn btn-primary">Add Integration</a>
-            {% endif %}
-        </li>
-        {% endif %}
-
         <li>
             <img src="{% static 'img/integrations/email.png' %}"
                 class="icon" alt="Email icon" />
@@ -258,16 +172,12 @@
             <a href="{% url 'hc-add-gotify' project.code %}" class="btn btn-primary">Add Integration</a>
         </li>
 
-        {% if enable_linenotify %}
         <li>
-            <img src="{% static 'img/integrations/linenotify.png' %}"
-                class="icon" alt="LINE Notify icon" />
-
-            <h2>LINE Notify</h2>
-            <p>Receive a notification on LINE when a check goes up or down.</p>
-            <a href="{% url 'hc-add-linenotify' project.code %}" class="btn btn-primary">Add Integration</a>
+            <img src="{% static 'img/integrations/group.png' %}" class="icon" alt="Group icon" />
+            <h2>Group</h2>
+            <p> Deliver to multiple integrations at once.</p>
+            <a href="{% url 'hc-add-group' project.code %}" class="btn btn-primary">Add Integration</a>
         </li>
-        {% endif %}
 
         {% if enable_matrix %}
         <li>
@@ -418,6 +328,21 @@
             <h2>Signal</h2>
             <p>Get a Signal message when a check goes up or down.</p>
             <a href="{% url 'hc-add-signal' project.code %}" class="btn btn-primary">Add Integration</a>
+        </li>
+        {% endif %}
+
+        {% if enable_slack %}
+        <li>
+            <img src="{% static 'img/integrations/slack.png' %}"
+                class="icon" alt="Slack icon" />
+
+            <h2>Slack</h2>
+            <p>A messaging app for teams.</p>
+            {% if enable_slack_btn %}
+            <a href="{% url 'hc-add-slack-btn' project.code %}" class="btn btn-primary">Add Integration</a>
+            {% else %}
+            <a href="{% url 'hc-add-slack' project.code %}" class="btn btn-primary">Add Integration</a>
+            {% endif %}
         </li>
         {% endif %}
 
@@ -621,14 +546,14 @@
 
 
                     {% if ch.kind == "shell" %}
-                        {% if ch.cmd_down %}
+                        {% if ch.shell.cmd_down %}
                             <p><strong>Execute on "down" events:</strong></p>
-                            <pre>{{ ch.cmd_down }}</pre>
+                            <pre>{{ ch.shell.cmd_down }}</pre>
                         {% endif %}
 
-                        {% if ch.cmd_up %}
+                        {% if ch.shell.cmd_up %}
                             <p><strong>Execute on "up" events:</strong></p>
-                            <pre>{{ ch.cmd_up }}</pre>
+                            <pre>{{ ch.shell.cmd_up }}</pre>
                         {% endif %}
                     {% endif %}
                 </div>

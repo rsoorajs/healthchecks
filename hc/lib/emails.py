@@ -4,20 +4,21 @@ import time
 from email.utils import make_msgid
 from smtplib import SMTPDataError, SMTPServerDisconnected
 from threading import Thread
+from typing import Any
 
 from django.conf import settings
-from django.core.mail import EmailMultiAlternatives
+from django.core.mail import EmailMultiAlternatives as Message
 from django.template.loader import render_to_string as render
 
 
 class EmailThread(Thread):
     MAX_TRIES = 3
 
-    def __init__(self, message):
+    def __init__(self, message: Message) -> None:
         Thread.__init__(self)
         self.message = message
 
-    def run(self):
+    def run(self) -> None:
         for attempt in range(0, self.MAX_TRIES):
             try:
                 # Make sure each retry creates a new connection:
@@ -35,7 +36,9 @@ class EmailThread(Thread):
                 time.sleep(1)
 
 
-def make_message(name, to, ctx, headers={}):
+def make_message(
+    name: str, to: str | list[str], ctx: dict[str, Any], headers: dict[str, str] = {}
+) -> Message:
     subject = render("emails/%s-subject.html" % name, ctx).strip()
     body = render("emails/%s-body-text.html" % name, ctx)
     html = render("emails/%s-body-html.html" % name, ctx)
@@ -54,24 +57,19 @@ def make_message(name, to, ctx, headers={}):
     else:
         from_email = settings.DEFAULT_FROM_EMAIL
 
-    msg = EmailMultiAlternatives(
-        subject,
-        body,
-        from_email=from_email,
-        to=[to] if isinstance(to, str) else to,
-        headers=headers,
-    )
+    to_list = [to] if isinstance(to, str) else to
+    msg = Message(subject, body, from_email, to_list, headers=headers)
     msg.attach_alternative(html, "text/html")
     return msg
 
 
-def send(msg, block=False):
+def send(message: Message, block: bool = False) -> None:
     assert settings.EMAIL_HOST, (
         "No SMTP configuration,"
         " see https://github.com/healthchecks/healthchecks#sending-emails"
     )
 
-    t = EmailThread(msg)
+    t = EmailThread(message)
     if block or hasattr(settings, "BLOCKING_EMAILS"):
         # In tests, we send emails synchronously
         # so we can inspect the outgoing messages
@@ -82,48 +80,53 @@ def send(msg, block=False):
         t.start()
 
 
-def login(to, ctx):
+def login(to: str, ctx: dict[str, Any]) -> None:
     send(make_message("login", to, ctx))
 
 
-def transfer_request(to, ctx):
+def transfer_request(to: str, ctx: dict[str, Any]) -> None:
     send(make_message("transfer-request", to, ctx))
 
 
-def alert(to, ctx, headers={}):
+def alert(to: str, ctx: dict[str, Any], headers: dict[str, str]) -> None:
     send(make_message("alert", to, ctx, headers=headers))
 
 
-def verify_email(to, ctx):
+def verify_email(to: str, ctx: dict[str, Any]) -> None:
     send(make_message("verify-email", to, ctx))
 
 
-def report(to, ctx, headers={}):
+def report(to: str, ctx: dict[str, Any], headers: dict[str, str]) -> None:
     m = make_message("report", to, ctx, headers=headers)
     send(m, block=True)
 
 
-def deletion_notice(to, ctx, headers={}):
-    m = make_message("deletion-notice", to, ctx, headers=headers)
+def nag(to: str, ctx: dict[str, Any], headers: dict[str, str]) -> None:
+    m = make_message("nag", to, ctx, headers=headers)
     send(m, block=True)
 
 
-def deletion_scheduled(to, ctx, headers={}):
-    m = make_message("deletion-scheduled", to, ctx, headers=headers)
+def deletion_notice(to: str, ctx: dict[str, Any]) -> None:
+    m = make_message("deletion-notice", to, ctx)
     send(m, block=True)
 
 
-def sms_limit(to, ctx):
+def deletion_scheduled(to: list[str], ctx: dict[str, Any]) -> None:
+    m = make_message("deletion-scheduled", to, ctx)
+    send(m, block=True)
+
+
+def sms_limit(to: str, ctx: dict[str, Any]) -> None:
     send(make_message("sms-limit", to, ctx))
 
 
-def call_limit(to, ctx):
+def call_limit(to: str, ctx: dict[str, Any]) -> None:
     send(make_message("phone-call-limit", to, ctx))
 
 
-def sudo_code(to, ctx):
+def sudo_code(to: str, ctx: dict[str, Any]) -> None:
     send(make_message("sudo-code", to, ctx))
 
 
-def signal_rate_limited(to, ctx):
+def signal_rate_limited(to: str, ctx: dict[str, Any]) -> None:
     send(make_message("signal-rate-limited", to, ctx))

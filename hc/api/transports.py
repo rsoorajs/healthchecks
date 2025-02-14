@@ -1,67 +1,57 @@
 from __future__ import annotations
 
+import email
 import json
 import logging
 import os
 import socket
 import time
 import uuid
+from collections.abc import Iterator
+from email.message import EmailMessage
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from urllib.parse import quote, urlencode, urljoin
 
 from django.conf import settings
-from django.contrib.humanize.templatetags.humanize import naturaltime
+from django.db import close_old_connections
 from django.template.loader import render_to_string
 from django.utils.html import escape
-from django.utils.timezone import now
+from pydantic import BaseModel, ValidationError
 
 from hc.accounts.models import Profile
-from hc.api.schemas import telegram_migration
 from hc.front.templatetags.hc_extras import (
     absolute_site_logo_url,
     fix_asterisks,
     sortchecks,
 )
-from hc.lib import curl, emails, jsonschema
+from hc.lib import curl, emails
 from hc.lib.date import format_duration
 from hc.lib.html import extract_signal_styles
 from hc.lib.signing import sign_bounce_id
 from hc.lib.string import replace
+from hc.lib.typealias import JSONDict, JSONList, JSONValue
+
+if TYPE_CHECKING:
+    from hc.api.models import Channel, Check, Flip, Notification, Ping
 
 try:
     import apprise
+
+    have_apprise = True
 except ImportError:
-    # Enforce
-    settings.APPRISE_ENABLED = False
+    have_apprise = False
+
+logger = logging.getLogger(__name__)
 
 
-def tmpl(template_name, **ctx) -> str:
-    template_path = "integrations/%s" % template_name
+def tmpl(template_name: str, **ctx: Any) -> str:
+    template_path = f"integrations/{template_name}"
     # \xa0 is non-breaking space. It causes SMS messages to use UCS2 encoding
     # and cost twice the money.
     return render_to_string(template_path, ctx).strip().replace("\xa0", " ")
 
 
-def get_nested(obj, path, default=None):
-    """Retrieve a field from nested dictionaries.
-
-    Example:
-
-    >>> get_nested({"foo": {"bar": "baz"}}, "foo.bar")
-    'baz'
-
-    """
-
-    needle = obj
-    for key in path.split("."):
-        if not isinstance(needle, dict):
-            return default
-        if key not in needle:
-            return default
-        needle = needle[key]
-    return needle
-
-
-def get_ping_body(ping, maxlen=None) -> str | None:
+def get_ping_body(ping: Ping | None, maxlen: int | None = None) -> str | None:
     """Return ping body for a given Ping object.
 
     Does two extra things in addition to simply calling Ping.get_body():
@@ -85,16 +75,16 @@ def get_ping_body(ping, maxlen=None) -> str | None:
 
 
 class TransportError(Exception):
-    def __init__(self, message, permanent=False) -> None:
+    def __init__(self, message: str, permanent: bool = False) -> None:
         self.message = message
         self.permanent = permanent
 
 
-class Transport(object):
-    def __init__(self, channel):
+class Transport:
+    def __init__(self, channel: Channel):
         self.channel = channel
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         """Send notification about current status of the check.
 
         This method raises TransportError on error, and returns None
@@ -104,7 +94,7 @@ class Transport(object):
 
         raise NotImplementedError()
 
-    def is_noop(self, check) -> bool:
+    def is_noop(self, status: str) -> bool:
         """Return True if transport will ignore check's current status.
 
         This method is overridden in Webhook subclass where the user can
@@ -115,7 +105,7 @@ class Transport(object):
 
         return False
 
-    def down_checks(self, check):
+    def down_checks(self, check: Check) -> list[Check] | None:
         """Return a sorted list of other checks in the same project that are down.
 
         If there are no other hecks in the project, return None instead of empty list.
@@ -133,72 +123,80 @@ class Transport(object):
 
         return down_siblings
 
-    def last_ping(self, check):
-        """Return the last Ping object for this check."""
+    def last_ping(self, flip: Flip) -> Ping | None:
+        """Return the last Ping object received before this flip."""
 
-        if check.pk:
-            return check.ping_set.order_by("created").last()
+        if not flip.owner.pk:
+            return None
 
+        # Sort by "created". Sorting by "id" can cause postgres to pick api_ping.id
+        # index (slow if the api_ping table is big)
+        q = flip.owner.ping_set.order_by("created")
+        # Make sure we're not selecting pings that occurred after the flip
+        q = q.filter(created__lte=flip.created)
 
-class RemovedTransport(Transport):
-    """Dummy transport class for obsolete integrations: hipchat, pagerteam."""
-
-    def is_noop(self, check) -> bool:
-        return True
+        return q.last()
 
 
 class Email(Transport):
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not self.channel.email_verified:
             raise TransportError("Email not verified")
 
         unsub_link = self.channel.get_unsub_link()
 
         headers = {
-            "List-Unsubscribe": "<%s>" % unsub_link,
+            "List-Unsubscribe": f"<{unsub_link}>",
             "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+            "X-Bounce-ID": sign_bounce_id(f"n.{notification.code}"),
         }
-
-        if notification:
-            headers["X-Bounce-ID"] = sign_bounce_id("n.%s" % notification.code)
 
         from hc.accounts.models import Profile
 
         # If this email address has an associated account, include
         # a summary of projects the account has access to
         try:
-            profile = Profile.objects.get(user__email=self.channel.email_value)
+            profile = Profile.objects.get(user__email=self.channel.email.value)
             projects = list(profile.projects())
         except Profile.DoesNotExist:
             projects = None
 
-        ping = self.last_ping(check)
+        ping = self.last_ping(flip)
         body = get_ping_body(ping)
+        subject = None
+        if ping is not None and ping.scheme == "email" and body:
+            parsed = email.message_from_string(body, policy=email.policy.SMTP)
+            assert isinstance(parsed, EmailMessage)
+            subject = parsed.get("subject", "")
+
         ctx = {
-            "check": check,
+            "flip": flip,
+            "check": flip.owner,
             "ping": ping,
             "body": body,
+            "subject": subject,
             "projects": projects,
             "unsub_link": unsub_link,
         }
 
-        emails.alert(self.channel.email_value, ctx, headers)
+        emails.alert(self.channel.email.value, ctx, headers)
 
-    def is_noop(self, check) -> bool:
-        if check.status == "down":
-            return not self.channel.email_notify_down
+    def is_noop(self, status: str) -> bool:
+        if status == "down":
+            return not self.channel.email.notify_down
         else:
-            return not self.channel.email_notify_up
+            return not self.channel.email.notify_up
 
 
 class Shell(Transport):
-    def prepare(self, template: str, check) -> str:
+    def prepare(self, template: str, flip: Flip) -> str:
         """Replace placeholders with actual values."""
 
+        check = flip.owner
         ctx = {
             "$CODE": str(check.code),
-            "$STATUS": check.status,
-            "$NOW": now().replace(microsecond=0).isoformat(),
+            "$STATUS": flip.new_status,
+            "$NOW": flip.created.replace(microsecond=0).isoformat(),
             "$NAME": check.name,
             "$TAGS": check.tags,
         }
@@ -208,25 +206,25 @@ class Shell(Transport):
 
         return replace(template, ctx)
 
-    def is_noop(self, check) -> bool:
-        if check.status == "down" and not self.channel.cmd_down:
+    def is_noop(self, status: str) -> bool:
+        if status == "down" and not self.channel.shell.cmd_down:
             return True
 
-        if check.status == "up" and not self.channel.cmd_up:
+        if status == "up" and not self.channel.shell.cmd_up:
             return True
 
         return False
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.SHELL_ENABLED:
             raise TransportError("Shell commands are not enabled")
 
-        if check.status == "up":
-            cmd = self.channel.cmd_up
-        elif check.status == "down":
-            cmd = self.channel.cmd_down
+        if flip.new_status == "up":
+            cmd = self.channel.shell.cmd_up
+        elif flip.new_status == "down":
+            cmd = self.channel.shell.cmd_down
 
-        cmd = self.prepare(cmd, check)
+        cmd = self.prepare(cmd, flip)
         code = os.system(cmd)
 
         if code != 0:
@@ -235,77 +233,130 @@ class Shell(Transport):
 
 class HttpTransport(Transport):
     @classmethod
-    def raise_for_response(cls, response):
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
         # Subclasses can override this method to produce a more specific message.
         raise TransportError(f"Received status code {response.status_code}")
 
     @classmethod
-    def _request(cls, method, url, **kwargs) -> None:
-        kwargs["timeout"] = 10
-
+    def _request(
+        cls,
+        method: str,
+        url: str,
+        *,
+        params: curl.Params,
+        data: curl.Data,
+        json: Any,
+        headers: curl.Headers,
+        auth: curl.Auth,
+    ) -> None:
         try:
-            r = curl.request(method, url, **kwargs)
+            r = curl.request(
+                method,
+                url,
+                params=params,
+                data=data,
+                json=json,
+                headers=headers,
+                auth=auth,
+                timeout=30,
+            )
             if r.status_code not in (200, 201, 202, 204):
                 cls.raise_for_response(r)
         except curl.CurlError as e:
             raise TransportError(e.message)
 
     @classmethod
-    def _request_with_retries(cls, method, url, use_retries=True, **kwargs) -> None:
-        start = time.time()
-
-        tries_left = 3 if use_retries else 1
+    def request(
+        cls,
+        method: str,
+        url: str,
+        *,
+        retry: bool,
+        params: curl.Params = None,
+        data: curl.Data = None,
+        json: Any = None,
+        headers: curl.Headers = None,
+        auth: curl.Auth = None,
+    ) -> None:
+        tries_left = 3 if retry else 1
         while True:
             try:
-                return cls._request(method, url, **kwargs)
+                return cls._request(
+                    method,
+                    url,
+                    params=params,
+                    data=data,
+                    json=json,
+                    headers=headers,
+                    auth=auth,
+                )
             except TransportError as e:
                 tries_left = 0 if e.permanent else tries_left - 1
-
-                # If we have no tries left *or* have already used more than
-                # 15 seconds of time then abort the retry loop by re-raising
+                # If we have no tries left then abort the retry loop by re-raising
                 # the exception:
-                if tries_left == 0 or time.time() - start > 15:
+                if tries_left == 0:
                     raise e
 
+    # Convenience wrapper around self.request for making "POST" requests
     @classmethod
-    def get(cls, url, **kwargs) -> None:
-        cls._request_with_retries("get", url, **kwargs)
-
-    @classmethod
-    def post(cls, url, **kwargs) -> None:
-        cls._request_with_retries("post", url, **kwargs)
-
-    @classmethod
-    def put(cls, url, **kwargs) -> None:
-        cls._request_with_retries("put", url, **kwargs)
+    def post(
+        cls,
+        url: str,
+        retry: bool = True,
+        *,
+        params: curl.Params = None,
+        data: curl.Data = None,
+        json: Any = None,
+        headers: curl.Headers = None,
+        auth: curl.Auth = None,
+    ) -> None:
+        cls.request(
+            "post",
+            url,
+            retry=retry,
+            params=params,
+            data=data,
+            json=json,
+            headers=headers,
+            auth=auth,
+        )
 
 
 class Webhook(HttpTransport):
     def prepare(
-        self, template: str, check, urlencode=False, latin1=False, allow_ping_body=False
+        self,
+        template: str,
+        flip: Flip,
+        urlencode: bool = False,
+        latin1: bool = False,
+        allow_ping_body: bool = False,
     ) -> str:
         """Replace variables with actual values."""
 
         def safe(s: str) -> str:
             return quote(s) if urlencode else s
 
+        check = flip.owner
         ctx = {
             "$CODE": str(check.code),
-            "$STATUS": check.status,
-            "$NOW": safe(now().replace(microsecond=0).isoformat()),
+            "$STATUS": flip.new_status,
+            "$NOW": safe(flip.created.replace(microsecond=0).isoformat()),
+            "$NAME_JSON": safe(json.dumps(check.name)),
             "$NAME": safe(check.name),
+            "$SLUG": check.slug,
             "$TAGS": safe(check.tags),
             "$JSON": safe(json.dumps(check.to_dict())),
         }
 
         # Materialize ping body only if template refers to it.
         if allow_ping_body and "$BODY" in template:
-            body = get_ping_body(self.last_ping(check))
+            body = get_ping_body(self.last_ping(flip))
+            ctx["$BODY_JSON"] = json.dumps(body if body else "")
             ctx["$BODY"] = body if body else ""
 
         if "$EXITSTATUS" in template:
             ctx["$EXITSTATUS"] = "-1"
-            lp = self.last_ping(check)
+            lp = self.last_ping(flip)
             if lp and lp.exitstatus is not None:
                 ctx["$EXITSTATUS"] = str(lp.exitstatus)
 
@@ -319,51 +370,49 @@ class Webhook(HttpTransport):
 
         return result
 
-    def is_noop(self, check) -> bool:
-        if check.status == "down" and not self.channel.url_down:
-            return True
-
-        if check.status == "up" and not self.channel.url_up:
+    def is_noop(self, status: str) -> bool:
+        spec = self.channel.webhook_spec(status)
+        if not spec.url:
             return True
 
         return False
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.WEBHOOKS_ENABLED:
             raise TransportError("Webhook notifications are not enabled.")
 
-        spec = self.channel.webhook_spec(check.status)
-        if not spec["url"]:
+        spec = self.channel.webhook_spec(flip.new_status)
+        if not spec.url:
             raise TransportError("Empty webhook URL")
 
-        url = self.prepare(spec["url"], check, urlencode=True)
+        method = spec.method.lower()
+        url = self.prepare(spec.url, flip, urlencode=True)
+        retry = True
+        if notification.owner is None:
+            # This is a test notification.
+            # When sending a test notification, don't retry on failures.
+            retry = False
+
+        body, body_bytes = spec.body, None
+        if body and spec.method in ("POST", "PUT"):
+            body = self.prepare(body, flip, allow_ping_body=True)
+            body_bytes = body.encode()
+
         headers = {}
-        for key, value in spec["headers"].items():
+        for key, value in spec.headers.items():
             # Header values should contain ASCII and latin-1 only
-            headers[key] = self.prepare(value, check, latin1=True)
+            headers[key] = self.prepare(value, flip, latin1=True)
 
-        body = spec["body"]
-        if body:
-            body = self.prepare(body, check, allow_ping_body=True).encode()
-
-        # When sending a test notification, don't retry on failures.
-        use_retries = True
-        if notification and notification.owner is None:
-            use_retries = False  # this is a test notification
-
-        if spec["method"] == "GET":
-            self.get(url, use_retries=use_retries, headers=headers)
-        elif spec["method"] == "POST":
-            self.post(url, use_retries=use_retries, data=body, headers=headers)
-        elif spec["method"] == "PUT":
-            self.put(url, use_retries=use_retries, data=body, headers=headers)
+        # Give up database connection before potentially long network IO:
+        close_old_connections()
+        self.request(method, url, retry=retry, data=body_bytes, headers=headers)
 
 
-class SlackFields(list):
+class SlackFields(list[JSONValue]):
     """Helper class for preparing [{"title": ..., "value": ... }, ...] structures."""
 
-    def add(self, title, value, short=True):
-        field = {"title": title, "value": value}
+    def add(self, title: str, value: str, short: bool = True) -> None:
+        field: JSONDict = {"title": title, "value": value}
         if short:
             field["short"] = True
         self.append(field)
@@ -372,20 +421,22 @@ class SlackFields(list):
 class Slackalike(HttpTransport):
     """Base class for transports that use Slack-compatible incoming webhooks."""
 
-    def payload(self, check):
+    def payload(self, flip: Flip) -> JSONDict:
         """Prepare JSON-serializable payload for Slack-compatible incoming webhook."""
+        check = flip.owner
         name = check.name_then_code()
         fields = SlackFields()
-        result = {
+        result: JSONDict = {
             "username": settings.SITE_NAME,
             "icon_url": absolute_site_logo_url(),
             "attachments": [
                 {
-                    "color": "good" if check.status == "up" else "danger",
-                    "fallback": f'The check "{name}" is {check.status.upper()}.',
+                    "color": "good" if flip.new_status == "up" else "danger",
+                    "fallback": f'The check "{name}" is {flip.new_status.upper()}.',
                     "mrkdwn_in": ["fields"],
-                    "title": f"“{name}” is {check.status.upper()}.",
+                    "title": f"“{name}” is {flip.new_status.upper()}.",
                     "title_link": check.cloaked_url(),
+                    "text": f"Reason: {flip.reason_long()}." if flip.reason else None,
                     "fields": fields,
                 }
             ],
@@ -403,17 +454,15 @@ class Slackalike(HttpTransport):
         if check.kind == "simple":
             fields.add("Period", format_duration(check.timeout))
 
-        if check.kind == "cron":
+        if check.kind in ("cron", "oncalendar"):
             fields.add("Schedule", fix_asterisks(check.schedule))
             fields.add("Time Zone", check.tz)
 
-        fields.add("Total Pings", str(check.n_pings))
-
-        if ping := self.last_ping(check):
-            created_str = naturaltime(ping.created)
-            formatted_kind = ping.get_kind_display()
-            fields.add("Last Ping", f"{formatted_kind}, {created_str}")
+        if ping := self.last_ping(flip):
+            fields.add("Total Pings", str(ping.n))
+            fields.add("Last Ping", ping.formatted_kind_created())
         else:
+            fields.add("Total Pings", "0")
             fields.add("Last Ping", "Never")
 
         body = get_ping_body(ping, maxlen=1000)
@@ -422,76 +471,119 @@ class Slackalike(HttpTransport):
 
         return result
 
-    def notify(self, check, notification=None) -> None:
-        self.post(self.channel.slack_webhook_url, json=self.payload(check))
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        self.post(self.channel.slack_webhook_url, json=self.payload(flip))
 
 
 class Slack(Slackalike):
     @classmethod
-    def raise_for_response(cls, response):
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
         message = f"Received status code {response.status_code}"
-        # If Slack returns 404, this endpoint is unlikely to ever work again
-        # https://api.slack.com/messaging/webhooks#handling_errors
-        permanent = response.status_code == 404
+        permanent = False
+        if response.status_code == 404:
+            # If Slack returns 404, this endpoint is unlikely to ever work again
+            # https://api.slack.com/messaging/webhooks#handling_errors
+            permanent = True
+        elif response.status_code == 400:
+            if response.content == b"invalid_token":
+                # If Slack returns 400 with "invalid_token" in response body,
+                # we're using a deactivated user's token to post to a private channel.
+                # In theory this condition can recover (a deactivated user can be
+                # activated), but in practice it is unlikely to happen.
+                permanent = True
+            else:
+                # Log it for later inspection
+                logger.debug("Slack returned HTTP 400 with body: %s", response.content)
+
         raise TransportError(message, permanent=permanent)
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.SLACK_ENABLED:
             raise TransportError("Slack notifications are not enabled.")
 
-        self.post(self.channel.slack_webhook_url, json=self.payload(check))
+        self.post(self.channel.slack_webhook_url, json=self.payload(flip))
 
 
 class Mattermost(Slackalike):
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.MATTERMOST_ENABLED:
             raise TransportError("Mattermost notifications are not enabled.")
 
-        self.post(self.channel.slack_webhook_url, json=self.payload(check))
+        self.post(self.channel.slack_webhook_url, json=self.payload(flip))
 
 
 class Discord(Slackalike):
-    def notify(self, check, notification=None) -> None:
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        message = f"Received status code {response.status_code}"
+        # Consider 404 a permanent failure
+        permanent = response.status_code == 404
+        raise TransportError(message, permanent=permanent)
+
+    def notify(self, flip: Flip, notification: Notification) -> None:
         url = self.channel.discord_webhook_url + "/slack"
-        self.post(url, json=self.payload(check))
+        self.post(url, json=self.payload(flip))
 
 
 class Opsgenie(HttpTransport):
+    class ErrorModel(BaseModel):
+        message: str
+
     @classmethod
-    def raise_for_response(cls, response):
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
         message = f"Received status code {response.status_code}"
         try:
-            details = response.json().get("message")
-            if isinstance(details, str):
-                message += f' with a message: "{details}"'
-        except ValueError:
+            r = Opsgenie.ErrorModel.model_validate_json(response.content)
+            message += f' with a message: "{r.message}"'
+        except ValidationError:
             pass
 
         raise TransportError(message)
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.OPSGENIE_ENABLED:
             raise TransportError("Opsgenie notifications are not enabled.")
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": "GenieKey %s" % self.channel.opsgenie_key,
+            "Authorization": f"GenieKey {self.channel.opsgenie.key}",
         }
 
-        payload = {"alias": str(check.code), "source": settings.SITE_NAME}
+        check = flip.owner
+        payload: JSONDict = {
+            "alias": str(check.unique_key),
+            "source": settings.SITE_NAME,
+        }
 
-        if check.status == "down":
-            payload["tags"] = check.tags_list()
-            payload["message"] = tmpl("opsgenie_message.html", check=check)
-            payload["note"] = tmpl("opsgenie_note.html", check=check)
-            payload["description"] = tmpl("opsgenie_description.html", check=check)
+        if flip.new_status == "down":
+            ctx = {"flip": flip, "check": check, "ping": self.last_ping(flip)}
+            payload["tags"] = cast(JSONValue, check.tags_list())
+            payload["message"] = tmpl("opsgenie_message.html", **ctx)
+            payload["description"] = check.desc
+
+            details: JSONDict = {}
+            details["Project"] = check.project.name
+            if ping := self.last_ping(flip):
+                details["Total pings"] = ping.n
+                details["Last ping"] = ping.formatted_kind_created()
+            else:
+                details["Total pings"] = 0
+                details["Last ping"] = "Never"
+
+            if check.kind == "simple":
+                details["Period"] = format_duration(check.timeout)
+            if check.kind in ("cron", "oncalendar"):
+                details["Schedule"] = f"<code>{check.schedule}</code>"
+                details["Time zone"] = check.tz
+            details["Full details"] = check.cloaked_url()
+            payload["details"] = details
 
         url = "https://api.opsgenie.com/v2/alerts"
-        if self.channel.opsgenie_region == "eu":
+        if self.channel.opsgenie.region == "eu":
             url = "https://api.eu.opsgenie.com/v2/alerts"
 
-        if check.status == "up":
-            url += "/%s/close?identifierType=alias" % check.code
+        if flip.new_status == "up":
+            url += f"/{check.unique_key}/close?identifierType=alias"
 
         self.post(url, json=payload, headers=headers)
 
@@ -499,30 +591,37 @@ class Opsgenie(HttpTransport):
 class PagerDuty(HttpTransport):
     URL = "https://events.pagerduty.com/generic/2010-04-15/create_event.json"
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.PD_ENABLED:
             raise TransportError("PagerDuty notifications are not enabled.")
 
-        details = {
+        check = flip.owner
+        details: JSONDict = {
             "Project": check.project.name,
-            "Total pings": check.n_pings,
-            "Last ping": tmpl("pd_last_ping.html", check=check),
         }
+        if ping := self.last_ping(flip):
+            details["Total pings"] = ping.n
+            details["Last ping"] = ping.formatted_kind_created()
+        else:
+            details["Total pings"] = 0
+            details["Last ping"] = "Never"
+
         if check.desc:
             details["Description"] = check.desc
         if check.tags:
             details["Tags"] = ", ".join(check.tags_list())
         if check.kind == "simple":
             details["Period"] = format_duration(check.timeout)
-        if check.kind == "cron":
+        if check.kind in ("cron", "oncalendar"):
             details["Schedule"] = check.schedule
             details["Time zone"] = check.tz
 
-        description = tmpl("pd_description.html", check=check)
+        ctx = {"flip": flip, "check": check, "status": flip.new_status}
+        description = tmpl("pd_description.html", **ctx)
         payload = {
-            "service_key": self.channel.pd_service_key,
-            "incident_key": str(check.code),
-            "event_type": "trigger" if check.status == "down" else "resolve",
+            "service_key": self.channel.pd.service_key,
+            "incident_key": check.unique_key,
+            "event_type": "trigger" if flip.new_status == "down" else "resolve",
             "description": description,
             "client": settings.SITE_NAME,
             "client_url": check.details_url(),
@@ -533,33 +632,44 @@ class PagerDuty(HttpTransport):
 
 
 class PagerTree(HttpTransport):
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.PAGERTREE_ENABLED:
             raise TransportError("PagerTree notifications are not enabled.")
 
         url = self.channel.value
         headers = {"Content-Type": "application/json"}
+        ctx = {
+            "flip": flip,
+            "check": flip.owner,
+            "status": flip.new_status,
+            "ping": self.last_ping(flip),
+        }
         payload = {
-            "incident_key": str(check.code),
-            "event_type": "trigger" if check.status == "down" else "resolve",
-            "title": tmpl("pagertree_title.html", check=check),
-            "description": tmpl("pagertree_description.html", check=check),
+            "incident_key": str(flip.owner.unique_key),
+            "event_type": "trigger" if flip.new_status == "down" else "resolve",
+            "title": tmpl("pagertree_title.html", **ctx),
+            "description": tmpl("pagertree_description.html", **ctx),
             "client": settings.SITE_NAME,
             "client_url": settings.SITE_ROOT,
-            "tags": ",".join(check.tags_list()),
+            "tags": " ".join(flip.owner.tags_list()),
         }
 
         self.post(url, json=payload, headers=headers)
 
 
 class Pushbullet(HttpTransport):
-    def notify(self, check, notification=None) -> None:
-        text = tmpl("pushbullet_message.html", check=check)
+    def notify(self, flip: Flip, notification: Notification) -> None:
         url = "https://api.pushbullet.com/v2/pushes"
         headers = {
             "Access-Token": self.channel.value,
             "Content-Type": "application/json",
         }
+        text = tmpl(
+            "pushbullet_message.html",
+            flip=flip,
+            check=flip.owner,
+            status=flip.new_status,
+        )
         payload = {"type": "note", "title": settings.SITE_NAME, "body": text}
         self.post(url, json=payload, headers=headers)
 
@@ -568,17 +678,38 @@ class Pushover(HttpTransport):
     URL = "https://api.pushover.net/1/messages.json"
     CANCEL_TMPL = "https://api.pushover.net/1/receipts/cancel_by_tag/%s.json"
 
-    def is_noop(self, check) -> bool:
+    class ErrorModel(BaseModel):
+        user: str = ""
+
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        message = f"Received status code {response.status_code}"
+        permanent = False
+        if response.status_code == 400:
+            try:
+                doc = Pushover.ErrorModel.model_validate_json(response.content)
+                if doc.user == "invalid":
+                    message += " (invalid user)"
+                    permanent = True
+            except ValidationError:
+                logger.debug("Pushover HTTP 400 with body: %s", response.content)
+
+        raise TransportError(message, permanent=permanent)
+
+    def is_noop(self, status: str) -> bool:
         pieces = self.channel.value.split("|")
         _, prio = pieces[0], pieces[1]
 
         # The third element, if present, is the priority for "up" events
-        if check.status == "up" and len(pieces) == 3:
+        if status == "up" and len(pieces) == 3:
             prio = pieces[2]
 
         return int(prio) == -3
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        if not settings.PUSHOVER_API_TOKEN:
+            raise TransportError("Pushover notifications are not enabled.")
+
         pieces = self.channel.value.split("|")
         user_key, down_prio = pieces[0], pieces[1]
 
@@ -592,17 +723,24 @@ class Pushover(HttpTransport):
         if not TokenBucket.authorize_pushover(user_key):
             raise TransportError("Rate limit exceeded")
 
+        check = flip.owner
         # If down events have the emergency priority,
         # send a cancel call first
-        if check.status == "up" and down_prio == "2":
+        if flip.new_status == "up" and down_prio == "2":
             url = self.CANCEL_TMPL % check.unique_key
             cancel_payload = {"token": settings.PUSHOVER_API_TOKEN}
             self.post(url, data=cancel_payload)
 
-        ctx = {"check": check, "down_checks": self.down_checks(check)}
+        ctx = {
+            "flip": flip,
+            "check": check,
+            "status": flip.new_status,
+            "ping": self.last_ping(flip),
+            "down_checks": self.down_checks(check),
+        }
         text = tmpl("pushover_message.html", **ctx)
         title = tmpl("pushover_title.html", **ctx)
-        prio = up_prio if check.status == "up" else down_prio
+        prio = up_prio if flip.new_status == "up" else down_prio
 
         payload = {
             "token": settings.PUSHOVER_API_TOKEN,
@@ -612,6 +750,8 @@ class Pushover(HttpTransport):
             "html": 1,
             "priority": int(prio),
             "tags": check.unique_key,
+            "url": check.cloaked_url(),
+            "url_title": f"View on {settings.SITE_NAME}",
         }
 
         # Emergency notification
@@ -623,14 +763,15 @@ class Pushover(HttpTransport):
 
 
 class RocketChat(HttpTransport):
-    def payload(self, check):
+    def payload(self, flip: Flip) -> JSONDict:
+        check = flip.owner
         url = check.cloaked_url()
-        color = "#5cb85c" if check.status == "up" else "#d9534f"
+        color = "#5cb85c" if flip.new_status == "up" else "#d9534f"
         fields = SlackFields()
-        result = {
+        result: JSONDict = {
             "alias": settings.SITE_NAME,
             "avatar": absolute_site_logo_url(),
-            "text": f"[{check.name_then_code()}]({url}) is {check.status.upper()}.",
+            "text": tmpl("rocketchat_message.html", flip=flip, check=check),
             "attachments": [{"color": color, "fields": fields}],
         }
 
@@ -646,44 +787,53 @@ class RocketChat(HttpTransport):
         if check.kind == "simple":
             fields.add("Period", format_duration(check.timeout))
 
-        if check.kind == "cron":
+        if check.kind in ("cron", "oncalendar"):
             fields.add("Schedule", fix_asterisks(check.schedule))
             fields.add("Time Zone", check.tz)
 
-        fields.add("Total Pings", str(check.n_pings))
-
-        if ping := self.last_ping(check):
-            created_str = naturaltime(ping.created)
-            formatted_kind = ping.get_kind_display()
-            fields.add("Last Ping", f"{formatted_kind}, {created_str}")
+        if ping := self.last_ping(flip):
+            fields.add("Total Pings", str(ping.n))
+            fields.add("Last Ping", ping.formatted_kind_created())
             if body_size := ping.get_body_size():
                 bytes_str = "byte" if body_size == 1 else "bytes"
                 ping_url = f"{url}#ping-{ping.n}"
                 text = f"{body_size} {bytes_str}, [show body]({ping_url})"
                 fields.add("Last Ping Body", text)
         else:
+            fields.add("Total Pings", "0")
             fields.add("Last Ping", "Never")
 
         return result
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.ROCKETCHAT_ENABLED:
             raise TransportError("Rocket.Chat notifications are not enabled.")
-        self.post(self.channel.value, json=self.payload(check))
+        self.post(self.channel.value, json=self.payload(flip))
 
 
 class VictorOps(HttpTransport):
-    def notify(self, check, notification=None) -> None:
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        message = f"Received status code {response.status_code}"
+        # If the endpoint returns 404, this endpoint is unlikely to ever work again
+        permanent = response.status_code == 404
+        raise TransportError(message, permanent=permanent)
+
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.VICTOROPS_ENABLED:
             raise TransportError("Splunk On-Call notifications are not enabled.")
 
-        description = tmpl("victorops_description.html", check=check)
-        mtype = "CRITICAL" if check.status == "down" else "RECOVERY"
+        ctx = {
+            "flip": flip,
+            "check": flip.owner,
+            "status": flip.new_status,
+        }
+        mtype = "CRITICAL" if flip.new_status == "down" else "RECOVERY"
         payload = {
-            "entity_id": str(check.code),
+            "entity_id": str(flip.owner.unique_key),
             "message_type": mtype,
-            "entity_display_name": check.name_then_code(),
-            "state_message": description,
+            "entity_display_name": flip.owner.name_then_code(),
+            "state_message": tmpl("victorops_description.html", **ctx),
             "monitoring_tool": settings.SITE_NAME,
         }
 
@@ -691,17 +841,27 @@ class VictorOps(HttpTransport):
 
 
 class Matrix(HttpTransport):
-    def get_url(self):
-        s = quote(self.channel.value)
+    def get_url(self) -> str:
+        room_id = quote(self.channel.value)
 
+        assert isinstance(settings.MATRIX_HOMESERVER, str)
         url = settings.MATRIX_HOMESERVER
-        url += "/_matrix/client/r0/rooms/%s/send/m.room.message?" % s
+        url += f"/_matrix/client/r0/rooms/{room_id}/send/m.room.message?"
         url += urlencode({"access_token": settings.MATRIX_ACCESS_TOKEN})
         return url
 
-    def notify(self, check, notification=None) -> None:
-        plain = tmpl("matrix_description.html", check=check)
-        formatted = tmpl("matrix_description_formatted.html", check=check)
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        ping = self.last_ping(flip)
+        ctx = {
+            "flip": flip,
+            "check": flip.owner,
+            "status": flip.new_status,
+            "ping": ping,
+            "body": get_ping_body(ping, maxlen=1000),
+            "down_checks": self.down_checks(flip.owner),
+        }
+        plain = tmpl("matrix_description.html", **ctx)
+        formatted = tmpl("matrix_description_formatted.html", **ctx)
         payload = {
             "msgtype": "m.text",
             "body": plain,
@@ -713,45 +873,46 @@ class Matrix(HttpTransport):
 
 
 class MigrationRequiredError(TransportError):
-    def __init__(self, message, new_chat_id: int):
+    def __init__(self, message: str, new_chat_id: int):
         super().__init__(message, permanent=True)
         self.new_chat_id = new_chat_id
 
 
 class Telegram(HttpTransport):
-    SM = "https://api.telegram.org/bot%s/sendMessage" % settings.TELEGRAM_TOKEN
+    SM = f"https://api.telegram.org/bot{settings.TELEGRAM_TOKEN}/sendMessage"
+
+    class MigrationParameters(BaseModel):
+        migrate_to_chat_id: int
+
+    class ErrorModel(BaseModel):
+        description: str
+        parameters: Telegram.MigrationParameters | None = None
 
     @classmethod
-    def raise_for_response(cls, response):
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
         message = f"Received status code {response.status_code}"
         try:
-            doc = response.json()
-        except ValueError:
+            m = Telegram.ErrorModel.model_validate_json(response.content)
+        except ValidationError:
             raise TransportError(message)
 
-        # If the error payload contains the migrate_to_chat_id field,
-        # raise MigrationRequiredError, with the new chat_id included
-        try:
-            jsonschema.validate(doc, telegram_migration)
-            description = doc["description"]
-            chat_id = doc["parameters"]["migrate_to_chat_id"]
-            raise MigrationRequiredError(description, chat_id)
-        except jsonschema.ValidationError:
-            pass
+        if m.parameters:
+            # If the error payload contains the migrate_to_chat_id field,
+            # raise MigrationRequiredError, with the new chat_id included
+            chat_id = m.parameters.migrate_to_chat_id
+            raise MigrationRequiredError(m.description, chat_id)
 
         permanent = False
-        description = doc.get("description")
-        if isinstance(description, str):
-            message += f' with a message: "{description}"'
-            if description == "Forbidden: the group chat was deleted":
-                permanent = True
-            if description == "Forbidden: bot was blocked by the user":
-                permanent = True
+        message += f' with a message: "{m.description}"'
+        if m.description == "Forbidden: the group chat was deleted":
+            permanent = True
+        if m.description == "Forbidden: bot was blocked by the user":
+            permanent = True
 
         raise TransportError(message, permanent=permanent)
 
     @classmethod
-    def send(cls, chat_id, thread_id, text):
+    def send(cls, chat_id: int, thread_id: int | None, text: str) -> None:
         # Telegram.send is a separate method because it is also used in
         # hc.front.views.telegram_bot to send invite links.
         payload = {
@@ -762,16 +923,18 @@ class Telegram(HttpTransport):
         }
         cls.post(cls.SM, json=payload)
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         from hc.api.models import TokenBucket
 
-        if not TokenBucket.authorize_telegram(self.channel.telegram_id):
+        if not TokenBucket.authorize_telegram(self.channel.telegram.id):
             raise TransportError("Rate limit exceeded")
 
-        ping = self.last_ping(check)
+        ping = self.last_ping(flip)
         ctx = {
-            "check": check,
-            "down_checks": self.down_checks(check),
+            "flip": flip,
+            "check": flip.owner,
+            "status": flip.new_status,
+            "down_checks": self.down_checks(flip.owner),
             "ping": ping,
             # Telegram's message limit is 4096 chars, but clip body at 1000 for
             # consistency
@@ -780,23 +943,43 @@ class Telegram(HttpTransport):
         text = tmpl("telegram_message.html", **ctx)
 
         try:
-            self.send(self.channel.telegram_id, self.channel.telegram_thread_id, text)
+            self.send(self.channel.telegram.id, self.channel.telegram.thread_id, text)
         except MigrationRequiredError as e:
             # Save the new chat_id, then try sending again:
             self.channel.update_telegram_id(e.new_chat_id)
-            self.send(self.channel.telegram_id, self.channel.telegram_thread_id, text)
+            self.send(self.channel.telegram.id, self.channel.telegram.thread_id, text)
 
 
 class Sms(HttpTransport):
     URL = "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json"
 
-    def is_noop(self, check) -> bool:
-        if check.status == "down":
-            return not self.channel.sms_notify_down
-        else:
-            return not self.channel.sms_notify_up
+    class ErrorModel(BaseModel):
+        code: int
 
-    def notify(self, check, notification=None) -> None:
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        if response.status_code == 400:
+            try:
+                doc = Sms.ErrorModel.model_validate_json(response.content, strict=True)
+                if doc.code == 21211:
+                    raise TransportError("Invalid phone number", permanent=True)
+            except ValidationError:
+                pass
+
+            logger.debug("Twilio Messages HTTP 400 with body: %s", response.content)
+
+        raise TransportError(f"Received status code {response.status_code}")
+
+    def is_noop(self, status: str) -> bool:
+        if status == "down":
+            return not self.channel.phone.notify_down
+        else:
+            return not self.channel.phone.notify_up
+
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        if not settings.TWILIO_ACCOUNT or not settings.TWILIO_AUTH:
+            raise TransportError("SMS notifications are not enabled")
+
         profile = Profile.objects.for_user(self.channel.project.owner)
         if not profile.authorize_sms():
             profile.send_sms_limit_notice("SMS")
@@ -804,20 +987,26 @@ class Sms(HttpTransport):
 
         url = self.URL % settings.TWILIO_ACCOUNT
         auth = (settings.TWILIO_ACCOUNT, settings.TWILIO_AUTH)
-        text = tmpl("sms_message.html", check=check, site_name=settings.SITE_NAME)
+        text = tmpl(
+            "sms_message.html",
+            flip=flip,
+            check=flip.owner,
+            status=flip.new_status,
+            site_name=settings.SITE_NAME,
+        )
 
         data = {
-            "To": self.channel.phone_number,
+            "To": self.channel.phone.value,
             "Body": text,
+            "StatusCallback": notification.status_url(),
+            "RiskCheck": "disable",
         }
 
         if settings.TWILIO_MESSAGING_SERVICE_SID:
             data["MessagingServiceSid"] = settings.TWILIO_MESSAGING_SERVICE_SID
         else:
+            assert settings.TWILIO_FROM
             data["From"] = settings.TWILIO_FROM
-
-        if notification:
-            data["StatusCallback"] = notification.status_url()
 
         self.post(url, data=data, auth=auth)
 
@@ -825,10 +1014,33 @@ class Sms(HttpTransport):
 class Call(HttpTransport):
     URL = "https://api.twilio.com/2010-04-01/Accounts/%s/Calls.json"
 
-    def is_noop(self, check) -> bool:
-        return check.status != "down"
+    class ErrorModel(BaseModel):
+        code: int
 
-    def notify(self, check, notification=None) -> None:
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        if response.status_code == 400:
+            try:
+                doc = Call.ErrorModel.model_validate_json(response.content, strict=True)
+                if doc.code == 21211:
+                    raise TransportError("Invalid phone number", permanent=True)
+            except ValidationError:
+                pass
+
+            logger.debug("Twilio Calls HTTP 400 with body: %s", response.content)
+        raise TransportError(f"Received status code {response.status_code}")
+
+    def is_noop(self, status: str) -> bool:
+        return status != "down"
+
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        if (
+            not settings.TWILIO_ACCOUNT
+            or not settings.TWILIO_AUTH
+            or not settings.TWILIO_FROM
+        ):
+            raise TransportError("Call notifications are not enabled")
+
         profile = Profile.objects.for_user(self.channel.project.owner)
         if not profile.authorize_call():
             profile.send_call_limit_notice()
@@ -836,16 +1048,13 @@ class Call(HttpTransport):
 
         url = self.URL % settings.TWILIO_ACCOUNT
         auth = (settings.TWILIO_ACCOUNT, settings.TWILIO_AUTH)
-        twiml = tmpl("call_message.html", check=check, site_name=settings.SITE_NAME)
-
+        ctx = {"check": flip.owner, "site_name": settings.SITE_NAME}
         data = {
             "From": settings.TWILIO_FROM,
-            "To": self.channel.phone_number,
-            "Twiml": twiml,
+            "To": self.channel.phone.value,
+            "Twiml": tmpl("call_message.html", **ctx),
+            "StatusCallback": notification.status_url(),
         }
-
-        if notification:
-            data["StatusCallback"] = notification.status_url()
 
         self.post(url, data=data, auth=auth)
 
@@ -853,34 +1062,65 @@ class Call(HttpTransport):
 class WhatsApp(HttpTransport):
     URL = "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json"
 
-    def is_noop(self, check) -> bool:
-        if check.status == "down":
-            return not self.channel.whatsapp_notify_down
-        else:
-            return not self.channel.whatsapp_notify_up
+    class ErrorModel(BaseModel):
+        code: int
 
-    def notify(self, check, notification=None) -> None:
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        if response.status_code == 400:
+            try:
+                doc = WhatsApp.ErrorModel.model_validate_json(
+                    response.content, strict=True
+                )
+                if doc.code == 21211:
+                    raise TransportError("Invalid phone number", permanent=True)
+            except ValidationError:
+                pass
+
+            logger.debug("WhatsApp HTTP 400 with body: %s", response.content)
+
+        raise TransportError(f"Received status code {response.status_code}")
+
+    def is_noop(self, status: str) -> bool:
+        if status == "down":
+            return not self.channel.phone.notify_down
+        else:
+            return not self.channel.phone.notify_up
+
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        for key in (
+            "TWILIO_USE_WHATSAPP",
+            "TWILIO_ACCOUNT",
+            "TWILIO_AUTH",
+            "TWILIO_FROM",
+            "TWILIO_MESSAGING_SERVICE_SID",
+            "WHATSAPP_DOWN_CONTENT_SID",
+            "WHATSAPP_UP_CONTENT_SID",
+        ):
+            if not getattr(settings, key):
+                raise TransportError("WhatsApp notifications are not enabled")
+
         profile = Profile.objects.for_user(self.channel.project.owner)
         if not profile.authorize_sms():
             profile.send_sms_limit_notice("WhatsApp")
             raise TransportError("Monthly message limit exceeded")
 
         url = self.URL % settings.TWILIO_ACCOUNT
+        assert settings.TWILIO_ACCOUNT and settings.TWILIO_AUTH
         auth = (settings.TWILIO_ACCOUNT, settings.TWILIO_AUTH)
-        text = tmpl("whatsapp_message.html", check=check, site_name=settings.SITE_NAME)
+        if flip.new_status == "down":
+            content_sid = settings.WHATSAPP_DOWN_CONTENT_SID
+        else:
+            content_sid = settings.WHATSAPP_UP_CONTENT_SID
 
         data = {
-            "To": f"whatsapp:{self.channel.phone_number}",
-            "Body": text,
+            "To": f"whatsapp:{self.channel.phone.value}",
+            "From": f"whatsapp:{settings.TWILIO_FROM}",
+            "MessagingServiceSid": settings.TWILIO_MESSAGING_SERVICE_SID,
+            "ContentSid": content_sid,
+            "ContentVariables": json.dumps({1: flip.owner.name_then_code()}),
+            "StatusCallback": notification.status_url(),
         }
-
-        if settings.TWILIO_MESSAGING_SERVICE_SID:
-            data["MessagingServiceSid"] = settings.TWILIO_MESSAGING_SERVICE_SID
-        else:
-            data["From"] = f"whatsapp:{settings.TWILIO_FROM}"
-
-        if notification:
-            data["StatusCallback"] = notification.status_url()
 
         self.post(url, data=data, auth=auth)
 
@@ -888,37 +1128,43 @@ class WhatsApp(HttpTransport):
 class Trello(HttpTransport):
     URL = "https://api.trello.com/1/cards"
 
-    def is_noop(self, check) -> bool:
-        return check.status != "down"
+    def is_noop(self, status: str) -> bool:
+        return status != "down"
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        if not settings.TRELLO_APP_KEY:
+            raise TransportError("Trello notifications are not enabled.")
+
+        ctx = {
+            "check": flip.owner,
+            "status": flip.new_status,
+            "ping": self.last_ping(flip),
+        }
         params = {
-            "idList": self.channel.trello_list_id,
-            "name": tmpl("trello_name.html", check=check),
-            "desc": tmpl("trello_desc.html", check=check),
+            "idList": self.channel.trello.list_id,
+            "name": tmpl("trello_name.html", **ctx),
+            "desc": tmpl("trello_desc.html", **ctx),
             "key": settings.TRELLO_APP_KEY,
-            "token": self.channel.trello_token,
+            "token": self.channel.trello.token,
         }
 
         self.post(self.URL, params=params)
 
 
 class Apprise(HttpTransport):
-    def notify(self, check, notification=None) -> None:
-        if not settings.APPRISE_ENABLED:
-            # Not supported and/or enabled
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        if not settings.APPRISE_ENABLED or not have_apprise:
             raise TransportError("Apprise is disabled and/or not installed")
 
         a = apprise.Apprise()
-        title = tmpl("apprise_title.html", check=check)
-        body = tmpl("apprise_description.html", check=check)
+        check, status, ping = flip.owner, flip.new_status, self.last_ping(flip)
+        title = tmpl("apprise_title.html", check=check, status=status)
+        body = tmpl("apprise_description.html", check=check, status=status, ping=ping)
 
         a.add(self.channel.value)
 
         notify_type = (
-            apprise.NotifyType.SUCCESS
-            if check.status == "up"
-            else apprise.NotifyType.FAILURE
+            apprise.NotifyType.SUCCESS if status == "up" else apprise.NotifyType.FAILURE
         )
 
         if not a.notify(body=body, title=title, notify_type=notify_type):
@@ -926,16 +1172,18 @@ class Apprise(HttpTransport):
 
 
 class MsTeams(HttpTransport):
-    def payload(self, check):
+    def payload(self, flip: Flip) -> JSONDict:
+        check = flip.owner
         name = check.name_then_code()
-        facts = []
-        result = {
+        facts: JSONList = []
+        sections: JSONList = [{"text": check.desc, "facts": facts}]
+        result: JSONDict = {
             "@type": "MessageCard",
             "@context": "https://schema.org/extensions",
-            "title": f"“{escape(name)}” is {check.status.upper()}.",
-            "summary": f"“{name}” is {check.status.upper()}.",
-            "themeColor": "5cb85c" if check.status == "up" else "d9534f",
-            "sections": [{"text": check.desc, "facts": facts}],
+            "title": f"“{escape(name)}” is {flip.new_status.upper()}.",
+            "summary": f"“{name}” is {flip.new_status.upper()}.",
+            "themeColor": "5cb85c" if flip.new_status == "up" else "d9534f",
+            "sections": sections,
             "potentialAction": [
                 {
                     "@type": "OpenUri",
@@ -952,77 +1200,190 @@ class MsTeams(HttpTransport):
         if check.kind == "simple":
             facts.append({"name": "Period:", "value": format_duration(check.timeout)})
 
-        if check.kind == "cron":
+        if check.kind in ("cron", "oncalendar"):
             facts.append({"name": "Schedule:", "value": fix_asterisks(check.schedule)})
             facts.append({"name": "Time Zone:", "value": check.tz})
 
-        facts.append({"name": "Total Pings:", "value": str(check.n_pings)})
-
-        if ping := self.last_ping(check):
-            text = f"{ping.get_kind_display()}, {naturaltime(ping.created)}"
-            facts.append({"name": "Last Ping:", "value": text})
+        if ping := self.last_ping(flip):
+            facts.append({"name": "Total Pings:", "value": str(ping.n)})
+            facts.append({"name": "Last Ping:", "value": ping.formatted_kind_created()})
         else:
+            facts.append({"name": "Total Pings:", "value": "0"})
             facts.append({"name": "Last Ping:", "value": "Never"})
 
         body = get_ping_body(ping, maxlen=1000)
         if body and "```" not in body:
             section_text = f"**Last Ping Body**:\n```\n{ body }\n```"
-            result["sections"].append({"text": section_text})
+            sections.append({"text": section_text})
 
         return result
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.MSTEAMS_ENABLED:
             raise TransportError("MS Teams notifications are not enabled.")
 
-        self.post(self.channel.value, json=self.payload(check))
+        self.post(self.channel.value, json=self.payload(flip))
+
+
+class MsTeamsWorkflow(HttpTransport):
+    def payload(self, flip: Flip) -> JSONDict:
+        check = flip.owner
+        name = check.name_then_code()
+        fields = SlackFields()
+        ctx = {
+            "flip": flip,
+            "check": flip.owner,
+            "status": flip.new_status,
+        }
+        text = tmpl("msteamsw_message.html", **ctx)
+
+        blocks: JSONList = [
+            {
+                "type": "TextBlock",
+                "text": text,
+                "weight": "bolder",
+                "size": "medium",
+                "wrap": True,
+                "style": "heading",
+            },
+            {
+                "type": "FactSet",
+                "facts": fields,
+            },
+        ]
+
+        result: JSONDict = {
+            "type": "message",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "contentUrl": None,
+                    "content": {
+                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "type": "AdaptiveCard",
+                        "fallbackText": f"“{escape(name)}” is {flip.new_status.upper()}.",
+                        "version": "1.2",
+                        "body": blocks,
+                        "actions": [
+                            {
+                                "type": "Action.OpenUrl",
+                                "title": f"View in {settings.SITE_NAME}",
+                                "url": check.cloaked_url(),
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+        if check.desc:
+            fields.add("Description:", check.desc.replace("\n", "\n\n"))
+
+        if check.project.name:
+            fields.add("Project:", check.project.name)
+
+        if tags := check.tags_list():
+            formatted_tags = " ".join(tags)
+            fields.add("Tags:", formatted_tags)
+
+        if check.kind == "simple":
+            fields.add("Period:", format_duration(check.timeout))
+
+        if check.kind in ("cron", "oncalendar"):
+            fields.add("Schedule:", fix_asterisks(check.schedule))
+            fields.add("Time Zone:", check.tz)
+
+        if ping := self.last_ping(flip):
+            fields.add("Total Pings:", str(ping.n))
+            fields.add("Last Ping:", ping.formatted_kind_created())
+        else:
+            fields.add("Total Pings:", "0")
+            fields.add("Last Ping:", "Never")
+
+        if body := get_ping_body(ping, maxlen=1000):
+            blocks.append(
+                {
+                    "type": "TextBlock",
+                    "text": "Last Ping Body:",
+                    "weight": "bolder",
+                }
+            )
+            blocks.append(
+                {
+                    "type": "CodeBlock",
+                    "codeSnippet": body,
+                    "language": "PlainText",
+                }
+            )
+
+        return result
+
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        if not settings.MSTEAMS_ENABLED:
+            raise TransportError("MS Teams notifications are not enabled.")
+
+        self.post(self.channel.value, json=self.payload(flip))
 
 
 class Zulip(HttpTransport):
+    class ErrorModel(BaseModel):
+        msg: str
+
     @classmethod
-    def raise_for_response(cls, response):
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
         message = f"Received status code {response.status_code}"
         try:
-            details = response.json().get("msg")
-            if isinstance(details, str):
-                message += f' with a message: "{details}"'
-        except ValueError:
+            f = Zulip.ErrorModel.model_validate_json(response.content)
+            message += f' with a message: "{f.msg}"'
+        except ValidationError:
             pass
 
         raise TransportError(message)
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.ZULIP_ENABLED:
             raise TransportError("Zulip notifications are not enabled.")
 
-        topic = self.channel.zulip_topic
+        topic = self.channel.zulip.topic
         if not topic:
-            topic = tmpl("zulip_topic.html", check=check)
+            topic = tmpl("zulip_topic.html", check=flip.owner, status=flip.new_status)
 
-        url = self.channel.zulip_site + "/api/v1/messages"
-        auth = (self.channel.zulip_bot_email, self.channel.zulip_api_key)
+        url = self.channel.zulip.site + "/api/v1/messages"
+        auth = (self.channel.zulip.bot_email, self.channel.zulip.api_key)
+        content = tmpl(
+            "zulip_content.html",
+            flip=flip,
+            check=flip.owner,
+            status=flip.new_status,
+        )
         data = {
-            "type": self.channel.zulip_type,
-            "to": self.channel.zulip_to,
+            "type": self.channel.zulip.mtype,
+            "to": self.channel.zulip.to,
             "topic": topic,
-            "content": tmpl("zulip_content.html", check=check),
+            "content": content,
         }
 
         self.post(url, data=data, auth=auth)
 
 
 class Spike(HttpTransport):
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.SPIKE_ENABLED:
             raise TransportError("Spike notifications are not enabled.")
 
         url = self.channel.value
         headers = {"Content-Type": "application/json"}
+        ctx = {
+            "flip": flip,
+            "check": flip.owner,
+            "status": flip.new_status,
+            "ping": self.last_ping(flip),
+        }
         payload = {
-            "check_id": str(check.code),
-            "title": tmpl("spike_title.html", check=check),
-            "message": tmpl("spike_description.html", check=check),
-            "status": check.status,
+            "check_id": str(flip.owner.unique_key),
+            "title": tmpl("spike_title.html", **ctx),
+            "message": tmpl("spike_description.html", **ctx),
+            "status": flip.new_status,
         }
 
         self.post(url, json=payload, headers=headers)
@@ -1031,24 +1392,66 @@ class Spike(HttpTransport):
 class LineNotify(HttpTransport):
     URL = "https://notify-api.line.me/api/notify"
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "Authorization": "Bearer %s" % self.channel.linenotify_token,
+            "Authorization": f"Bearer {self.channel.linenotify_token}",
         }
-        payload = {"message": tmpl("linenotify_message.html", check=check)}
-        self.post(self.URL, headers=headers, params=payload)
+        ctx = {
+            "check": flip.owner,
+            "status": flip.new_status,
+            "ping": self.last_ping(flip),
+        }
+        msg = tmpl("linenotify_message.html", **ctx)
+        self.post(self.URL, headers=headers, params={"message": msg})
+
+
+class SignalRateLimitFailure(TransportError):
+    def __init__(self, token: str, reply: bytes):
+        super().__init__("CAPTCHA proof required")
+        self.token = token
+        self.reply = reply
 
 
 class Signal(Transport):
-    def is_noop(self, check) -> bool:
-        if check.status == "down":
-            return not self.channel.signal_notify_down
-        else:
-            return not self.channel.signal_notify_up
+    TIMEOUT = 60
 
-    def send(self, recipient: str, message: str) -> None:
+    class Result(BaseModel):
+        type: str
+        token: str | None = None
+
+    class Response(BaseModel):
+        results: list[Signal.Result]
+
+    class Data(BaseModel):
+        response: Signal.Response
+
+    class Error(BaseModel):
+        code: int
+        data: Signal.Data | None = None
+
+    class Reply(BaseModel):
+        id: str = ""
+        error: Signal.Error | None = None
+
+        def get_results(self) -> list[Signal.Result]:
+            assert self.error
+            if self.error.data is None:
+                return []
+            return self.error.data.response.results
+
+    def is_noop(self, status: str) -> bool:
+        if status == "down":
+            return not self.channel.phone.notify_down
+        else:
+            return not self.channel.phone.notify_up
+
+    @classmethod
+    def send(cls, recipient: str, message: str) -> None:
         plaintext, styles = extract_signal_styles(message)
+        if "." in recipient:
+            # usernames must be prefixed with "u:"
+            recipient = f"u:{recipient}"
         payload = {
             "jsonrpc": "2.0",
             "method": "send",
@@ -1061,37 +1464,35 @@ class Signal(Transport):
         }
 
         payload_bytes = (json.dumps(payload) + "\n").encode()
-        for reply_bytes in self._read_replies(payload_bytes):
+        for reply_bytes in cls._read_replies(payload_bytes):
             try:
-                reply = json.loads(reply_bytes.decode())
-            except ValueError:
+                reply = Signal.Reply.model_validate_json(reply_bytes)
+            except ValidationError:
+                logger.error("unexpected signal-cli response: %s", reply_bytes)
                 raise TransportError("signal-cli call failed (unexpected response)")
 
-            if reply.get("id") == payload["id"]:
-                if "error" not in reply:
-                    # success!
-                    break
+            if reply.id != payload["id"]:
+                continue
 
-                for result in get_nested(reply, "error.data.response.results", []):
-                    if get_nested(result, "recipientAddress.number") != recipient:
-                        continue
+            if reply.error is None:
+                break  # success!
 
-                    if result.get("type") == "UNREGISTERED_FAILURE":
-                        raise TransportError("Recipient not found")
+            for result in reply.get_results():
+                if result.type == "UNREGISTERED_FAILURE":
+                    raise TransportError("Recipient not found", permanent=True)
 
-                    if result.get("type") == "RATE_LIMIT_FAILURE" and "token" in result:
-                        if self.channel:
-                            raw = reply_bytes.decode()
-                            self.channel.send_signal_captcha_alert(result["token"], raw)
-                            self.channel.send_signal_rate_limited_notice(
-                                message, plaintext
-                            )
-                        raise TransportError("CAPTCHA proof required")
+                if result.type == "RATE_LIMIT_FAILURE" and result.token:
+                    raise SignalRateLimitFailure(result.token, reply_bytes)
 
-                code = reply["error"].get("code")
-                raise TransportError("signal-cli call failed (%s)" % code)
+            msg = f"signal-cli call failed ({reply.error.code})"
+            msg_with_reply = msg + "\n" + reply_bytes.decode()
+            # Include signal-cli reply in the message we log for ourselves
+            logger.error(msg_with_reply)
+            # Do not include signal-cli reply in the message we show to the user
+            raise TransportError(msg)
 
-    def _read_replies(self, payload_bytes: bytes):
+    @classmethod
+    def _read_replies(cls, payload_bytes: bytes) -> Iterator[bytes]:
         """Send a request to signal-cli over UNIX socket. Read and yield replies.
 
         This method:
@@ -1119,7 +1520,7 @@ class Signal(Transport):
             address = settings.SIGNAL_CLI_SOCKET
 
         with socket.socket(stype, socket.SOCK_STREAM) as s:
-            s.settimeout(15)
+            s.settimeout(cls.TIMEOUT)
             try:
                 s.connect(address)
                 s.sendall(payload_bytes)
@@ -1133,41 +1534,65 @@ class Signal(Transport):
                         yield b"".join(buffer)
                         buffer = []
 
-                    if time.time() - start > 15:
+                    if time.time() - start > cls.TIMEOUT:
                         raise TransportError("signal-cli call timed out")
 
             except OSError as e:
-                msg = "signal-cli call failed (%s)" % e
+                msg = f"signal-cli call failed ({e})"
                 # Log the exception, so any configured logging handlers can pick it up
-                logging.getLogger(__name__).exception(msg)
+                logger.exception(msg)
 
                 # And then report it the same as other errors
                 raise TransportError(msg)
 
-    def notify(self, check, notification=None) -> None:
+    def notify(self, flip: Flip, notification: Notification) -> None:
         if not settings.SIGNAL_CLI_SOCKET:
             raise TransportError("Signal notifications are not enabled")
 
         from hc.api.models import TokenBucket
 
-        if not TokenBucket.authorize_signal(self.channel.phone_number):
+        if not TokenBucket.authorize_signal(self.channel.phone.value):
             raise TransportError("Rate limit exceeded")
 
         ctx = {
-            "check": check,
-            "ping": self.last_ping(check),
-            "down_checks": self.down_checks(check),
+            "flip": flip,
+            "check": flip.owner,
+            "status": flip.new_status,
+            "ping": self.last_ping(flip),
+            "down_checks": self.down_checks(flip.owner),
         }
         text = tmpl("signal_message.html", **ctx)
-        self.send(self.channel.phone_number, text)
+        tries_left = 2
+        while True:
+            try:
+                return self.send(self.channel.phone.value, text)
+            except SignalRateLimitFailure as e:
+                self.channel.send_signal_captcha_alert(e.token, e.reply.decode())
+                plaintext, _ = extract_signal_styles(text)
+                self.channel.send_signal_rate_limited_notice(text, plaintext)
+                raise e
+            except TransportError as e:
+                tries_left -= 1
+                if e.permanent or tries_left == 0:
+                    raise e
+                logger.debug("Retrying signal-cli call")
 
 
 class Gotify(HttpTransport):
-    def notify(self, check, notification=None) -> None:
-        url = urljoin(self.channel.gotify_url, "/message")
-        url += "?" + urlencode({"token": self.channel.gotify_token})
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        base = self.channel.gotify.url
+        if not base.endswith("/"):
+            base += "/"
 
-        ctx = {"check": check, "down_checks": self.down_checks(check)}
+        url = urljoin(base, "message")
+        url += "?" + urlencode({"token": self.channel.gotify.token})
+
+        ctx = {
+            "flip": flip,
+            "check": flip.owner,
+            "status": flip.new_status,
+            "down_checks": self.down_checks(flip.owner),
+        }
         payload = {
             "title": tmpl("gotify_title.html", **ctx),
             "message": tmpl("gotify_message.html", **ctx),
@@ -1179,31 +1604,60 @@ class Gotify(HttpTransport):
         self.post(url, json=payload)
 
 
+class Group(Transport):
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        channels = self.channel.group_channels
+        # If notification's owner field is None then this is a test notification,
+        # and we should pass is_test=True to channel.notify() calls
+        is_test = notification.owner is None
+        error_count = 0
+        for channel in channels:
+            error = channel.notify(flip, is_test=is_test)
+            if error and error != "no-op":
+                error_count += 1
+        if error_count:
+            raise TransportError(
+                f"{error_count} out of {len(channels)} notifications failed"
+            )
+
+
 class Ntfy(HttpTransport):
-    def priority(self, check):
-        if check.status == "up":
-            return self.channel.ntfy_priority_up
+    def priority(self, status: str) -> int:
+        if status == "up":
+            return self.channel.ntfy.priority_up
+        return self.channel.ntfy.priority
 
-        return self.channel.ntfy_priority
+    def is_noop(self, status: str) -> bool:
+        return self.priority(status) == 0
 
-    def is_noop(self, check) -> bool:
-        return self.priority(check) == 0
-
-    def notify(self, check, notification=None) -> None:
-        ctx = {"check": check, "down_checks": self.down_checks(check)}
+    def notify(self, flip: Flip, notification: Notification) -> None:
+        ctx = {
+            "flip": flip,
+            "check": flip.owner,
+            "status": flip.new_status,
+            "ping": self.last_ping(flip),
+            "down_checks": self.down_checks(flip.owner),
+        }
         payload = {
-            "topic": self.channel.ntfy_topic,
-            "priority": self.priority(check),
+            "topic": self.channel.ntfy.topic,
+            "priority": self.priority(flip.new_status),
             "title": tmpl("ntfy_title.html", **ctx),
             "message": tmpl("ntfy_message.html", **ctx),
-            "tags": ["red_circle" if check.status == "down" else "green_circle"],
+            "tags": ["red_circle" if flip.new_status == "down" else "green_circle"],
             "actions": [
                 {
                     "action": "view",
                     "label": f"View on {settings.SITE_NAME}",
-                    "url": check.cloaked_url(),
+                    "url": flip.owner.cloaked_url(),
                 }
             ],
         }
 
-        self.post(self.channel.ntfy_url, json=payload)
+        url = self.channel.ntfy.url
+        headers = {}
+        if self.channel.ntfy.token:
+            headers = {"Authorization": f"Bearer {self.channel.ntfy.token}"}
+
+        # Give up database connection before potentially long network IO:
+        close_old_connections()
+        self.post(url, headers=headers, json=payload)

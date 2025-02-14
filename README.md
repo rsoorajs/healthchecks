@@ -13,9 +13,9 @@ team management features: projects, team members, read-only access.
 
 The building blocks are:
 
-* Python 3.8+
-* Django 4.2
-* PostgreSQL or MySQL
+* Python 3.10+
+* Django 5.1
+* PostgreSQL, MySQL or MariaDB
 
 Healthchecks is licensed under the BSD 3-clause license.
 
@@ -31,28 +31,28 @@ Screenshots:
 The "My Checks" screen. Shows the status of all your cron jobs
 in a live-updating dashboard.
 
-![Screenshot of My Checks page](/static/img/my_checks@2x.png?raw=true "My Checks Page")
+![Screenshot of My Checks page](/static/img/my_checks.png?raw=true "My Checks Page")
 
 Each check has configurable Period and Grace Time parameters. Period is the expected
 time between pings. Grace Time specifies how long to wait before sending out alerts
 when a job is running late.
 
-![Screenshot of Period/Grace dialog](/static/img/period_grace@2x.png?raw=true "Period/Grace Dialog")
+![Screenshot of Period/Grace dialog](/static/img/period_grace.png?raw=true "Period/Grace Dialog")
 
 Alternatively, you can define the expected schedules using a cron expressions.
 Healthchecks uses the [cronsim](https://github.com/cuu508/cronsim) library to
 parse and evaluate cron expressions.
 
-![Screenshot of Cron dialog](/static/img/cron%402x.png?raw=true "Cron Dialog")
+![Screenshot of Cron dialog](/static/img/cron.png?raw=true "Cron Dialog")
 
 Check details page, with a live-updating event log.
 
-![Screenshot of Check Details page](/static/img/check_details@2x.png?raw=true "Check Details Page")
+![Screenshot of Check Details page](/static/img/check_details.png?raw=true "Check Details Page")
 
 Healthchecks provides status badges with public but hard-to-guess URLs.
 You can use them in your READMEs, dashboards, or status pages.
 
-![Screenshot of Badges page](/static/img/badges@2x.png?raw=true "Status Badges")
+![Screenshot of Badges page](/static/img/badges.png?raw=true "Status Badges")
 
 
 ## Setting Up for Development
@@ -136,14 +136,25 @@ visit `http://localhost:8000/admin/`
 
 ## Configuration
 
-Healthchecks reads configuration from environment variables.
+Healthchecks reads configuration from environment variables. See the
+[full list of configuration parameters](https://healthchecks.io/docs/self_hosted_configuration/)
+you can set via environment variables.
 
-[Full list of configuration parameters](https://healthchecks.io/docs/self_hosted_configuration/).
+In addition, Healthchecks reads settings from the `hc/local_settings.py` file if it
+exists. You can set or override any [standard Django setting](https://docs.djangoproject.com/en/5.1/ref/settings/)
+in this file. You can copy the provided `hc/local_settings.py.example` as
+`hc/local_settings.py` and use it as a starting point.
+
+If a setting is specified both as environment variable and in `hc/local_settings.py`,
+the latter takes precedence.
 
 ## Accessing Administration Panel
 
-Healthchecks comes with Django's administration panel where you can manually
-view and modify user accounts, projects, checks, integrations etc. To access it,
+Healthchecks comes with Django's administration panel where you can perform
+administrative tasks: delete user accounts, change passwords, increase limits for
+specific users, inspect contents of database tables.
+
+To access the administration panel,
 
  * if you haven't already, create a superuser account: `./manage.py createsuperuser`
  * log into the site using superuser credentials
@@ -236,24 +247,17 @@ Run it with the `--loop` argument to make it run continuously:
 
 ## Database Cleanup
 
-Healthchecks deletes old entries from `api_ping` and `api_notification`
+Healthchecks deletes old entries from `api_ping`, `api_flip`, and `api_notification`
 tables automatically. By default, Healthchecks keeps the 100 most recent
 pings for every check. You can set the limit higher to keep a longer history:
 go to the Administration Panel, look up user's **Profile** and modify its
 "Ping log limit" field.
 
-For each check, Healthchecks removes notifications that are older than the
-oldest stored ping for same check.
-
 Healthchecks also provides management commands for cleaning up
-`auth_user`, `api_tokenbucket` and `api_flip` tables.
+`auth_user` (user accounts) and `api_tokenbucket` (rate limiting records) tables,
+and for removing stale objects from external object storage.
 
-* Remove user accounts that match either of these conditions:
-  * Account was created more than 6 months ago, and user has never logged in.
-   These can happen when user enters invalid email address when signing up.
-  * Last login was more than 6 months ago, and the account has no checks.
-   Assume the user doesn't intend to use the account any more and would
-   probably *want* it removed.
+* Remove user accounts that are older than 1 month and have never logged in:
 
   ```sh
   ./manage.py pruneusers
@@ -265,15 +269,6 @@ Healthchecks also provides management commands for cleaning up
 
   ```sh
   ./manage.py prunetokenbucket
-  ```
-
-* Remove old records from the `api_flip` table. The Flip
-  objects are used to track status changes of checks, and to calculate
-  downtime statistics month by month. Flip objects from more than 3 months
-  ago are not used and can be safely removed.
-
-  ```sh
-  ./manage.py pruneflips
   ```
 
 * Remove old objects from external object storage. When an user removes
@@ -328,6 +323,25 @@ When `REMOTE_USER_HEADER` is set, Healthchecks will:
  - automatically create an user account if it does not exist
  - disable the default authentication methods (login link to email, password)
 
+The header name in `REMOTE_USER_HEADER` must be specified in upper-case,
+with any dashes replaced with underscores, and prefixed with `HTTP_`. For
+example, if your authentication proxy sets a `X-Authenticated-User` request
+header, you should set `REMOTE_USER_HEADER=HTTP_X_AUTHENTICATED_USER`.
+
+**Note on using `local_settings.py`:**
+When Healthchecks reads settings from environment variables and encounters
+the `REMOTE_USER_HEADER` environment variable, it sets *two* settings,
+`REMOTE_USER_HEADER` and `AUTHENTICATION_BACKENDS`. This logic has already run by the
+time Healthchecks reads `local_settings.py`. Therefore, if you configure Healthchecks
+using the `local_settings.py` file instead of environment variables, and specify
+`REMOTE_USER_HEADER` there, you will also need a line which sets the other setting,
+`AUTHENTICATION_BACKENDS`:
+
+```
+REMOTE_USER_HEADER = "HTTP_X_AUTHENTICATED_USER"
+AUTHENTICATION_BACKENDS = ["hc.accounts.backends.CustomHeaderBackend"]
+```
+
 ## External Object Storage
 
 Healthchecks can optionally store large ping bodies in S3-compatible object
@@ -364,19 +378,31 @@ for migrating ping bodies from external object storage back to the database.
 
 ### Slack
 
-To enable the Slack "self-service" integration, you will need to create a "Slack App".
+Healthchecks supports two Slack integration setup flows: legacy and app-based.
 
-To do so:
-* Create a _new Slack app_ on https://api.slack.com/apps/
-* Add at least _one scope_ in the permissions section to be able to deploy the app in your workspace (By example `incoming-webhook` for the `Bot Token Scopes`
-https://api.slack.com/apps/APP_ID/oauth?).
+The legacy flow does not require additional configuration and is used by default.
+In this flow the user creates an incoming webhook URL on the Slack side, and
+pastes the webhook URL in a form on the Healthchecks side.
+
+In the app-based flow the user clicks an "Add to Slack" button in Healthchecks,
+and gets transferred to a Slack-hosted dialog where they select the channel to
+post notifications to. This flow uses OAuth2 behind the scenes. To enable this
+flow, you will need to set up a Slack OAuth2 app:
+
+* Create a new Slack app on https://api.slack.com/apps/
+* Add at least one scope in the permissions section to be able to deploy the app in
+  your workspace (By example `incoming-webhook` for the `Bot Token Scopes`).
 * Add a _redirect url_ in the format `SITE_ROOT/integrations/add_slack_btn/`.
-  For example, if your SITE_ROOT is `https://my-hc.example.org` then the redirect URL would be
-  `https://my-hc.example.org/integrations/add_slack_btn/`.
-* Look up your Slack app for the Client ID and Client Secret at https://api.slack.com/apps/APP_ID/general? . Put them
+  For example, if your SITE_ROOT is `https://my-hc.example.org` then the redirect URL
+  would be `https://my-hc.example.org/integrations/add_slack_btn/`.
+* Look up your Slack app for the Client ID and Client Secret. Put them
   in `SLACK_CLIENT_ID` and `SLACK_CLIENT_SECRET` environment
-  variables.
+  variables. Once these variables are set, Healthchecks will switch from using
+  the legacy flow to using the app-based flow.
 
+The legacy and app-based flows only affect the user experience during the initial
+setup of Slack integrations. The contents of notifications posted to Slack are the same
+regardless of the setup flow used.
 
 ### Discord
 
@@ -534,6 +560,8 @@ in production.
      **Do not use it in production**, instead consider using
      [uWSGI](https://uwsgi-docs.readthedocs.io/en/latest/) or
      [gunicorn](https://gunicorn.org/).
+     An example of a minimal setup would be to install uWSGI using `pip3 install uwsgi`,
+     and to run `uwsgi --http :8000 --module hc.wsgi` from the project's root directory.
   *  `manage.py sendalerts` is the process that monitors checks and sends out
      monitoring alerts. It must be always running, it must be started on reboot, and it
      must be restarted if it itself crashes. On modern linux systems, a good option is

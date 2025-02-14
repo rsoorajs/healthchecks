@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import email.policy
 import time
+from collections.abc import Iterable
+from datetime import datetime
 from datetime import timedelta as td
+from datetime import timezone
 from email import message_from_bytes
-from typing import Iterable
+from typing import Any, Literal
 from uuid import UUID
 
+from cronsim import CronSim, CronSimError
 from django.conf import settings
 from django.core.signing import BadSignature
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Prefetch
 from django.http import (
     Http404,
@@ -26,20 +30,139 @@ from django.utils.timezone import now
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
+from oncalendar import OnCalendar, OnCalendarError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from hc.accounts.models import Profile, Project
-from hc.api import schemas
-from hc.api.decorators import authorize, authorize_read, cors, validate_json
+from hc.api.decorators import ApiRequest, authorize, authorize_read, cors
 from hc.api.forms import FlipsFiltersForm
 from hc.api.models import MAX_DURATION, Channel, Check, Flip, Notification, Ping
 from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
 from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string
+from hc.lib.tz import all_timezones, legacy_timezones
 
 
 class BadChannelException(Exception):
-    def __init__(self, message):
+    def __init__(self, message: str):
         self.message = message
+
+
+def guess_kind(schedule: str) -> str:
+    # If it is a single line with 5 components, it is probably a cron expression:
+    if "\n" not in schedule.strip() and len(schedule.split()) == 5:
+        return "cron"
+
+    return "oncalendar"
+
+
+class Spec(BaseModel):
+    channels: str | None = None
+    desc: str | None = None
+    failure_kw: str | None = Field(None, max_length=200)
+    filter_body: bool | None = None
+    filter_subject: bool | None = None
+    grace: td | None = Field(None, ge=60, le=31536000)
+    manual_resume: bool | None = None
+    methods: Literal["", "POST"] | None = None
+    name: str | None = Field(None, max_length=100)
+    schedule: str | None = Field(None, max_length=100)
+    slug: str | None = Field(None, max_length=100, pattern="^[a-z0-9-_]*$")
+    start_kw: str | None = Field(None, max_length=200)
+    subject: str | None = Field(None, max_length=200)
+    subject_fail: str | None = Field(None, max_length=200)
+    success_kw: str | None = Field(None, max_length=200)
+    tags: str | None = None
+    timeout: td | None = Field(None, ge=60, le=31536000)
+    tz: str | None = None
+    unique: list[Literal["name", "slug", "tags", "timeout", "grace"]] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_nulls(cls, data: dict[str, Any]) -> dict[str, Any]:
+        # Look for any null values in the incoming data. Replace them with a
+        # float. None of the fields have a float type, and we are using
+        # strict validation, so this will cause type validation to fail.
+        for k, v in data.items():
+            if v is None:
+                data[k] = 0.0
+        return data
+
+    @field_validator("timeout", "grace", mode="before")
+    @classmethod
+    def convert_to_timedelta(cls, v: Any) -> Any:
+        if isinstance(v, int):
+            return td(seconds=v)
+        return v
+
+    @field_validator("tz")
+    @classmethod
+    def check_tz(cls, v: str) -> str:
+        if v in legacy_timezones:
+            # Replace legacy timezone with the current canonical time zone
+            # (for example, Europe/Kiev -> Europe/Kyiv)
+            v = legacy_timezones[v]
+
+        if v not in all_timezones:
+            raise PydanticCustomError("tz_syntax", "not a valid timezone")
+        return v
+
+    @field_validator("schedule")
+    @classmethod
+    def check_schedule(cls, v: str) -> str:
+        if guess_kind(v) == "cron":
+            try:
+                # Test if cronsim accepts it and can calculate the next datetime
+                it = CronSim(v, datetime(2000, 1, 1))
+                next(it)
+            except (CronSimError, StopIteration):
+                raise PydanticCustomError("cron_syntax", "not a valid cron expression")
+        else:
+            try:
+                # Test if oncalendar accepts it, and can calculate the next datetime
+                oncalendar_it = OnCalendar(v, datetime(2000, 1, 1, tzinfo=timezone.utc))
+                next(oncalendar_it)
+            except (OnCalendarError, StopIteration):
+                raise PydanticCustomError("cron_syntax", "not a valid expression")
+
+        return v
+
+    def kind(self) -> str | None:
+        if self.schedule:
+            return guess_kind(self.schedule)
+
+        if self.timeout:
+            return "simple"
+
+        return None
+
+
+CUSTOM_ERRORS = {
+    "too_long": "%s is too long",
+    "string_too_long": "%s is too long",
+    "string_type": "%s is not a string",
+    "string_pattern_mismatch": "%s does not match pattern",
+    "less_than_equal": "%s is too large",
+    "greater_than_equal": "%s is too small",
+    "int_type": "%s is not a number",
+    "bool_type": "%s is not a boolean",
+    "literal_error": "%s has unexpected value",
+    "list_type": "%s is not an array",
+    "cron_syntax": "%s is not a valid cron or OnCalendar expression",
+    "tz_syntax": "%s is not a valid timezone",
+    "time_delta_type": "%s is not a number",
+}
+
+
+def format_first_error(exc: ValidationError) -> str:
+    first_error = exc.errors()[0]
+    subject = first_error["loc"][0]
+    if len(first_error["loc"]) == 2:
+        subject = f"an item in '{subject}'"
+
+    tmpl = CUSTOM_ERRORS[first_error["type"]]
+    return "json validation error: " + tmpl % subject
 
 
 @csrf_exempt
@@ -127,35 +250,41 @@ def ping_by_slug(
     return response
 
 
-def _lookup(project, spec):
-    if unique_fields := spec.get("unique"):
-        existing_checks = Check.objects.filter(project=project)
-        if "name" in unique_fields:
-            existing_checks = existing_checks.filter(name=spec.get("name"))
-        if "slug" in unique_fields:
-            existing_checks = existing_checks.filter(slug=spec.get("slug"))
-        if "tags" in unique_fields:
-            existing_checks = existing_checks.filter(tags=spec.get("tags"))
-        if "timeout" in unique_fields:
-            timeout = td(seconds=spec["timeout"])
-            existing_checks = existing_checks.filter(timeout=timeout)
-        if "grace" in unique_fields:
-            grace = td(seconds=spec["grace"])
-            existing_checks = existing_checks.filter(grace=grace)
+def _lookup(project: Project, spec: Spec) -> Check | None:
+    if not spec.unique:
+        return None
 
-        return existing_checks.first()
+    for field_name in spec.unique:
+        # If any field referenced in 'unique' is absent then return None
+        # (meaning, did not find a matching Check)
+        if getattr(spec, field_name) is None:
+            return None
+
+    existing_checks = Check.objects.filter(project=project)
+    if "name" in spec.unique:
+        existing_checks = existing_checks.filter(name=spec.name)
+    if "slug" in spec.unique:
+        existing_checks = existing_checks.filter(slug=spec.slug)
+    if "tags" in spec.unique:
+        existing_checks = existing_checks.filter(tags=spec.tags)
+    if "timeout" in spec.unique:
+        existing_checks = existing_checks.filter(timeout=spec.timeout)
+    if "grace" in spec.unique:
+        existing_checks = existing_checks.filter(grace=spec.grace)
+
+    return existing_checks.first()
 
 
-def _update(check, spec, v: int):
+def _update(check: Check, spec: Spec, v: int) -> None:
     new_channels: Iterable[Channel] | None
     # First, validate the supplied channel codes/names
-    if "channels" not in spec:
+    if spec.channels is None:
         # If the channels key is not present, don't update check's channels
         new_channels = None
-    elif spec["channels"] == "*":
+    elif spec.channels == "*":
         # "*" means "all project's channels"
         new_channels = Channel.objects.filter(project=check.project)
-    elif spec.get("channels") == "":
+    elif spec.channels == "":
         # "" means "empty list"
         new_channels = []
     else:
@@ -163,7 +292,7 @@ def _update(check, spec, v: int):
         new_channels = set()
         available = list(Channel.objects.filter(project=check.project))
 
-        for s in spec["channels"].split(","):
+        for s in spec.channels.split(","):
             if s == "":
                 raise BadChannelException("empty channel identifier")
 
@@ -181,39 +310,34 @@ def _update(check, spec, v: int):
         # and so do need to save() it:
         need_save = True
 
-    if "name" in spec and check.name != spec["name"]:
-        check.name = spec["name"]
+    if spec.name is not None and check.name != spec.name:
+        check.name = spec.name
         if v < 3:
             # v1 and v2 generates slug automatically from name
-            check.slug = slugify(spec["name"])
+            check.slug = slugify(spec.name)
         need_save = True
 
-    if "timeout" in spec and "schedule" not in spec:
-        new_timeout = td(seconds=spec["timeout"])
-        if check.kind != "simple" or check.timeout != new_timeout:
+    kind = spec.kind()
+    if kind == "simple":
+        if check.kind != "simple" or check.timeout != spec.timeout:
             check.kind = "simple"
-            check.timeout = new_timeout
+            check.timeout = spec.timeout
             need_save = True
 
-    if "grace" in spec:
-        new_grace = td(seconds=spec["grace"])
-        if check.grace != new_grace:
-            check.grace = new_grace
+    if kind in ("cron", "oncalendar"):
+        if check.kind != kind or check.schedule != spec.schedule:
+            check.kind = kind
+            assert spec.schedule is not None
+            check.schedule = spec.schedule
             need_save = True
 
-    if "schedule" in spec:
-        if check.kind != "cron" or check.schedule != spec["schedule"]:
-            check.kind = "cron"
-            check.schedule = spec["schedule"]
-            need_save = True
-
-    if "subject" in spec:
-        check.success_kw = spec["subject"]
+    if spec.subject is not None:
+        check.success_kw = spec.subject
         check.filter_subject = bool(check.success_kw or check.failure_kw)
         need_save = True
 
-    if "subject_fail" in spec:
-        check.failure_kw = spec["subject_fail"]
+    if spec.subject_fail is not None:
+        check.failure_kw = spec.subject_fail
         check.filter_subject = bool(check.success_kw or check.failure_kw)
         need_save = True
 
@@ -229,9 +353,11 @@ def _update(check, spec, v: int):
         "failure_kw",
         "filter_subject",
         "filter_body",
+        "grace",
     ):
-        if key in spec and getattr(check, key) != spec[key]:
-            setattr(check, key, spec[key])
+        v = getattr(spec, key)
+        if v is not None and getattr(check, key) != v:
+            setattr(check, key, v)
             need_save = True
 
     if need_save:
@@ -245,7 +371,7 @@ def _update(check, spec, v: int):
 
 
 @authorize_read
-def get_checks(request):
+def get_checks(request: ApiRequest) -> JsonResponse:
     q = Check.objects.filter(project=request.project)
     if not request.readonly:
         # Use QuerySet.only() and Prefetch() to prefetch channel codes only:
@@ -269,11 +395,15 @@ def get_checks(request):
     return JsonResponse({"checks": checks})
 
 
-@validate_json(schemas.check)
 @authorize
-def create_check(request):
+def create_check(request: ApiRequest) -> HttpResponse:
+    try:
+        spec = Spec.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return JsonResponse({"error": format_first_error(e)}, status=400)
+
     created = False
-    check = _lookup(request.project, request.json)
+    check = _lookup(request.project, spec)
     if check is None:
         if request.project.num_checks_available() <= 0:
             return HttpResponseForbidden()
@@ -282,7 +412,7 @@ def create_check(request):
         created = True
 
     try:
-        _update(check, request.json, request.v)
+        _update(check, spec, request.v)
     except BadChannelException as e:
         return JsonResponse({"error": e.message}, status=400)
 
@@ -291,7 +421,7 @@ def create_check(request):
 
 @csrf_exempt
 @cors("GET", "POST")
-def checks(request):
+def checks(request: HttpRequest) -> HttpResponse:
     if request.method == "POST":
         return create_check(request)
 
@@ -301,14 +431,14 @@ def checks(request):
 @cors("GET")
 @csrf_exempt
 @authorize
-def channels(request):
+def channels(request: ApiRequest) -> JsonResponse:
     q = Channel.objects.filter(project=request.project)
     channels = [ch.to_dict() for ch in q]
     return JsonResponse({"channels": channels})
 
 
 @authorize_read
-def get_check(request, code):
+def get_check(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
@@ -319,42 +449,60 @@ def get_check(request, code):
 @cors("GET")
 @csrf_exempt
 @authorize_read
-def get_check_by_unique_key(request, unique_key):
-    checks = Check.objects.filter(project=request.project.id)
-    for check in checks:
+def get_check_by_unique_key(request: ApiRequest, unique_key: str) -> HttpResponse:
+    for check in request.project.check_set.all():
         if check.unique_key == unique_key:
             return JsonResponse(check.to_dict(readonly=request.readonly, v=request.v))
     return HttpResponseNotFound()
 
 
-@validate_json(schemas.check)
 @authorize
-def update_check(request, code):
+def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
+    # Don't acquire lock right away, first see if the check exists
+    # and matches the API key
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
 
     try:
-        _update(check, request.json, request.v)
-    except BadChannelException as e:
-        return JsonResponse({"error": e.message}, status=400)
+        spec = Spec.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return JsonResponse({"error": format_first_error(e)}, status=400)
+
+    # Start a transaction, select for update, update.
+    # Use get_object_or_404 here again, in case another concurrent request
+    # has *just* deleted this check.
+    with transaction.atomic():
+        check = get_object_or_404(Check.objects.select_for_update(), code=code)
+        try:
+            _update(check, spec, request.v)
+        except BadChannelException as e:
+            return JsonResponse({"error": e.message}, status=400)
 
     return JsonResponse(check.to_dict(v=request.v))
 
 
 @authorize
-def delete_check(request, code):
+def delete_check(request: ApiRequest, code: UUID) -> HttpResponse:
+    # Don't acquire lock right away, first see if the check exists
+    # and matches the API key
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
 
-    check.lock_and_delete()
+    # Start a transaction, select for update, delete.
+    # Use get_object_or_404 here again, in case another concurrent request
+    # has *just* deleted this check.
+    with transaction.atomic():
+        check = get_object_or_404(Check.objects.select_for_update(), code=code)
+        check.delete()
+
     return JsonResponse(check.to_dict(v=request.v))
 
 
 @csrf_exempt
 @cors("POST", "DELETE", "GET")
-def single(request, code):
+def single(request: HttpRequest, code: UUID) -> HttpResponse:
     if request.method == "POST":
         return update_check(request, code)
 
@@ -366,9 +514,8 @@ def single(request, code):
 
 @cors("POST")
 @csrf_exempt
-@validate_json()
 @authorize
-def pause(request, code):
+def pause(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
@@ -390,9 +537,8 @@ def pause(request, code):
 
 @cors("POST")
 @csrf_exempt
-@validate_json()
 @authorize
-def resume(request, code):
+def resume(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
@@ -413,9 +559,8 @@ def resume(request, code):
 
 @cors("GET")
 @csrf_exempt
-@validate_json()
 @authorize
-def pings(request, code):
+def pings(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
@@ -430,7 +575,8 @@ def pings(request, code):
     # pings, regardless of the limit restriction
     pings = list(Ping.objects.filter(owner=check).order_by("-id")[:limit])
 
-    starts, num_misses = {}, 0
+    starts: dict[UUID | None, datetime | None] = {}
+    num_misses = 0
     for ping in reversed(pings):
         if ping.kind == "start":
             starts[ping.rid] = ping.created
@@ -441,9 +587,9 @@ def pings(request, code):
                 num_misses += 1
             else:
                 ping.duration = None
-                if starts[ping.rid]:
-                    if ping.created - starts[ping.rid] < MAX_DURATION:
-                        ping.duration = ping.created - starts[ping.rid]
+                start = starts[ping.rid]
+                if start and (ping.created - start) < MAX_DURATION:
+                    ping.duration = ping.created - start
 
             starts[ping.rid] = None
 
@@ -459,7 +605,7 @@ def pings(request, code):
 @cors("GET")
 @csrf_exempt
 @authorize
-def ping_body(request, code, n):
+def ping_body(request: ApiRequest, code: UUID, n: int) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
@@ -470,7 +616,11 @@ def ping_body(request, code, n):
         raise Http404()
 
     ping = get_object_or_404(Ping, owner=check, n=n)
-    body = ping.get_body_bytes()
+    try:
+        body = ping.get_body_bytes()
+    except Ping.GetBodyError:
+        return HttpResponse(status=503)
+
     if not body:
         raise Http404()
 
@@ -478,7 +628,7 @@ def ping_body(request, code, n):
     return response
 
 
-def flips(request, check):
+def flips(request: ApiRequest, check: Check) -> HttpResponse:
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
 
@@ -504,7 +654,7 @@ def flips(request, check):
 @cors("GET")
 @csrf_exempt
 @authorize_read
-def flips_by_uuid(request, code):
+def flips_by_uuid(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     return flips(request, check)
 
@@ -512,9 +662,8 @@ def flips_by_uuid(request, code):
 @cors("GET")
 @csrf_exempt
 @authorize_read
-def flips_by_unique_key(request, unique_key):
-    checks = Check.objects.filter(project=request.project.id)
-    for check in checks:
+def flips_by_unique_key(request: ApiRequest, unique_key: str) -> HttpResponse:
+    for check in request.project.check_set.all():
         if check.unique_key == unique_key:
             return flips(request, check)
     return HttpResponseNotFound()
@@ -523,9 +672,9 @@ def flips_by_unique_key(request, unique_key):
 @cors("GET")
 @csrf_exempt
 @authorize_read
-def badges(request):
+def badges(request: ApiRequest) -> JsonResponse:
     tags = set(["*"])
-    for check in Check.objects.filter(project=request.project):
+    for check in request.project.check_set.all():
         tags.update(check.tags_list())
 
     key = request.project.badge_key
@@ -543,9 +692,25 @@ def badges(request):
     return JsonResponse({"badges": badges})
 
 
+SHIELDS_COLORS = {"up": "success", "late": "important", "down": "critical"}
+
+
+def _shields_response(label: str, status: str) -> JsonResponse:
+    return JsonResponse(
+        {
+            "schemaVersion": 1,
+            "label": label,
+            "message": status,
+            "color": SHIELDS_COLORS[status],
+        }
+    )
+
+
 @never_cache
 @cors("GET")
-def badge(request, badge_key, signature, tag, fmt):
+def badge(
+    request: HttpRequest, badge_key: str, signature: str, tag: str, fmt: str
+) -> HttpResponse:
     if fmt not in ("svg", "json", "shields"):
         return HttpResponseNotFound()
 
@@ -557,11 +722,11 @@ def badge(request, badge_key, signature, tag, fmt):
         return HttpResponseNotFound()
 
     q = Check.objects.filter(project__badge_key=badge_key)
-    if tag != "*":
+    if tag == "*":
+        label = settings.MASTER_BADGE_LABEL
+    else:
         q = q.filter(tags__contains=tag)
         label = tag
-    else:
-        label = settings.MASTER_BADGE_LABEL
 
     status, total, grace, down = "up", 0, 0, 0
     for check in q:
@@ -584,15 +749,7 @@ def badge(request, badge_key, signature, tag, fmt):
                 status = "late"
 
     if fmt == "shields":
-        color = "success"
-        if status == "down":
-            color = "critical"
-        elif status == "late":
-            color = "important"
-
-        return JsonResponse(
-            {"schemaVersion": 1, "label": label, "message": status, "color": color}
-        )
+        return _shields_response(label, status)
 
     if fmt == "json":
         return JsonResponse(
@@ -603,9 +760,42 @@ def badge(request, badge_key, signature, tag, fmt):
     return HttpResponse(svg, content_type="image/svg+xml")
 
 
+@never_cache
+@cors("GET")
+def check_badge(
+    request: HttpRequest, states: int, badge_key: UUID, fmt: str
+) -> HttpResponse:
+    if fmt not in ("svg", "json", "shields"):
+        return HttpResponseNotFound()
+
+    check = get_object_or_404(Check, badge_key=badge_key)
+    check_status = check.get_status()
+    status = "up"
+    if check_status == "down":
+        status = "down"
+    elif check_status == "grace" and states == 3:
+        status = "late"
+
+    if fmt == "shields":
+        return _shields_response(check.name_then_code(), status)
+
+    if fmt == "json":
+        return JsonResponse(
+            {
+                "status": status,
+                "total": 1,
+                "grace": 1 if check_status == "grace" else 0,
+                "down": 1 if check_status == "down" else 0,
+            }
+        )
+
+    svg = get_badge_svg(check.name_then_code(), status)
+    return HttpResponse(svg, content_type="image/svg+xml")
+
+
 @csrf_exempt
 @require_POST
-def notification_status(request, code):
+def notification_status(request: HttpRequest, code: UUID) -> HttpResponse:
     """Handle notification delivery status callbacks."""
 
     try:
@@ -621,7 +811,7 @@ def notification_status(request, code):
     # Look for "error" and "mark_disabled" keys:
     if request.POST.get("error"):
         error = request.POST["error"][:200]
-        mark_disabled = request.POST.get("mark_disabled")
+        mark_disabled = bool(request.POST.get("mark_disabled"))
 
     # Handle "MessageStatus" key from Twilio
     if request.POST.get("MessageStatus") in ("failed", "undelivered"):
@@ -644,7 +834,7 @@ def notification_status(request, code):
     return HttpResponse()
 
 
-def metrics(request):
+def metrics(request: HttpRequest) -> HttpResponse:
     if not settings.METRICS_KEY:
         return HttpResponseForbidden()
 
@@ -662,7 +852,7 @@ def metrics(request):
     return JsonResponse(doc)
 
 
-def status(request):
+def status(request: HttpRequest) -> HttpResponse:
     with connection.cursor() as c:
         c.execute("SELECT 1")
         c.fetchone()
@@ -671,7 +861,7 @@ def status(request):
 
 
 @csrf_exempt
-def bounces(request):
+def bounces(request: HttpRequest) -> HttpResponse:
     msg = message_from_bytes(request.body, policy=email.policy.SMTP)
     to_local = msg.get("To", "").split("@")[0]
 

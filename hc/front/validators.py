@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 
 from cronsim import CronSim, CronSimError
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
+from oncalendar import OnCalendar, OnCalendarError
 
 from hc.lib.tz import all_timezones
 
@@ -28,7 +29,7 @@ class WebhookValidator(URLValidator):
         super().__call__(self.add_tld(value))
 
 
-class CronExpressionValidator(object):
+class CronValidator:
     message = "Not a valid cron expression."
 
     def __call__(self, value: str) -> None:
@@ -45,7 +46,25 @@ class CronExpressionValidator(object):
             raise ValidationError(message=self.message)
 
 
-class TimezoneValidator(object):
+class OnCalendarValidator:
+    message = "Not a valid OnCalendar expression."
+
+    def __call__(self, value: str) -> None:
+        # Expect 1 - 4 components
+        for expr in value.strip().split("\n"):
+            if len(expr.split()) > 4:
+                raise ValidationError(message=self.message)
+
+        try:
+            # Does oncalendar accept the schedule?
+            it = OnCalendar(value, datetime(2000, 1, 1, tzinfo=timezone.utc))
+            # Can it calculate the next datetime?
+            next(it)
+        except (OnCalendarError, StopIteration):
+            raise ValidationError(message=self.message)
+
+
+class TimezoneValidator:
     message = "Not a valid time zone."
 
     def __call__(self, value: str) -> None:

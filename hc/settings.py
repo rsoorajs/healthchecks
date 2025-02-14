@@ -4,19 +4,26 @@ Django settings for healthchecks project.
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
+
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
+from urllib.parse import urlparse
 
+from django.http.request import split_domain_port
+import django_stubs_ext
+
+django_stubs_ext.monkeypatch()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 def envbool(s: str, default: str) -> bool:
     v = os.getenv(s, default=default)
     if v not in ("", "True", "False"):
-        msg = "Unexpected value %s=%s, use 'True' or 'False'" % (s, v)
+        msg = f"Unexpected value {s}={v}, use 'True' or 'False'"
         raise Exception(msg)
     return v == "True"
 
@@ -32,13 +39,16 @@ def envint(s: str, default: str) -> int | None:
 SECRET_KEY = os.getenv("SECRET_KEY", "---")
 METRICS_KEY = os.getenv("METRICS_KEY")
 DEBUG = envbool("DEBUG", "True")
-ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "*").split(",")
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "healthchecks@example.org")
 SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL")
 USE_PAYMENTS = envbool("USE_PAYMENTS", "False")
 REGISTRATION_OPEN = envbool("REGISTRATION_OPEN", "True")
 if admins := os.getenv("ADMINS"):
     ADMINS = [(email, email) for email in admins.split(",")]
+
+if v := os.getenv("SECURE_PROXY_SSL_HEADER"):
+    SECURE_PROXY_SSL_HEADER = tuple(v.split(",", maxsplit=1))
+
 
 VERSION = ""
 
@@ -61,6 +71,7 @@ INSTALLED_APPS = (
     "compressor",
     "hc.api",
     "hc.front",
+    "hc.logs",
     "hc.payments",
 )
 
@@ -110,23 +121,21 @@ TEMPLATES = [
     }
 ]
 
-# Extend Django logging to log unhandled exceptions to console even when DEBUG=False
+# Extend Django logging to log unhandled exceptions
+# and all logs from hc.* loggers to the database.
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "filters": {
-        "require_debug_false": {
-            "()": "django.utils.log.RequireDebugFalse",
-        },
-    },
     "handlers": {
-        "console_debug_false": {
-            "level": "ERROR",
-            "class": "logging.StreamHandler",
-            "filters": ["require_debug_false"],
+        "db": {
+            "level": "DEBUG",
+            "class": "hc.logs.Handler",
         },
     },
-    "loggers": {"django.request": {"handlers": ["console_debug_false"]}},
+    "loggers": {
+        "django.request": {"level": "ERROR", "handlers": ["db"]},
+        "hc": {"level": "DEBUG", "handlers": ["db"]},
+    },
 }
 
 WSGI_APPLICATION = "hc.wsgi.application"
@@ -141,6 +150,10 @@ DATABASES: Mapping[str, Any] = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": os.getenv("DB_NAME", BASE_DIR / "hc.sqlite"),
+        "OPTIONS": {
+            "init_command": "PRAGMA busy_timeout = 5000;",
+            "transaction_mode": "IMMEDIATE",
+        },
     }
 }
 
@@ -166,7 +179,7 @@ if os.getenv("DB") == "postgres":
         }
     }
 
-if os.getenv("DB") == "mysql":
+if os.getenv("DB") in ["mysql", "mariadb"]:
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.mysql",
@@ -183,14 +196,28 @@ USE_TZ = True
 TIME_ZONE = "UTC"
 USE_I18N = False
 
-SITE_ROOT = os.getenv("SITE_ROOT", "http://localhost:8000")
+SITE_ROOT = os.getenv("SITE_ROOT", "http://localhost:8000").removesuffix("/")
 SITE_NAME = os.getenv("SITE_NAME", "Mychecks")
 SITE_LOGO_URL = os.getenv("SITE_LOGO_URL")
 MASTER_BADGE_LABEL = os.getenv("MASTER_BADGE_LABEL", SITE_NAME)
 PING_ENDPOINT = os.getenv("PING_ENDPOINT", SITE_ROOT + "/ping/")
 PING_EMAIL_DOMAIN = os.getenv("PING_EMAIL_DOMAIN", "localhost")
 PING_BODY_LIMIT = envint("PING_BODY_LIMIT", "10000")
-STATIC_URL = "/static/"
+# If PING_BODY_LIMIT is higher than the default value for DATA_UPLOAD_MAX_MEMORY_SIZE,
+# then we need to bump up DATA_UPLOAD_MAX_MEMORY_SIZE too:
+if PING_BODY_LIMIT and PING_BODY_LIMIT > 2621440:
+    DATA_UPLOAD_MAX_MEMORY_SIZE = PING_BODY_LIMIT
+_site_root_parts = urlparse(SITE_ROOT)
+LOGIN_URL = f"{_site_root_parts.path}/accounts/login/"
+STATIC_URL = f"{_site_root_parts.path}/static/"
+if v := os.getenv("ALLOWED_HOSTS"):
+    # If ALLOWED_HOSTS is set in environment, use it
+    ALLOWED_HOSTS = v.split(",")
+else:
+    # Otherwise, populate it with the domain from SITE_ROOT
+    domain, _ = split_domain_port(_site_root_parts.netloc)
+    ALLOWED_HOSTS = [domain]
+
 STATICFILES_DIRS = [BASE_DIR / "static"]
 STATIC_ROOT = BASE_DIR / "static-collected"
 STATICFILES_FINDERS = (
@@ -212,7 +239,7 @@ COMPRESS_FILTERS = {
 }
 
 
-def immutable_file_test(path, url):
+def immutable_file_test(path: Any, url: str) -> bool:
     return "/static/CACHE/" in url or "/static/fonts/" in url
 
 
@@ -239,6 +266,11 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 S3_REGION = os.getenv("S3_REGION")
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_TIMEOUT = envint("S3_TIMEOUT", "60")
+S3_SECURE = envbool("S3_SECURE", "True")
+
+# To enable statsd metric collection, set STATSD_HOST="host:hostport"
+# (example: "localhost:8125")
+STATSD_HOST = os.getenv("STATSD_HOST")
 
 # Integrations
 
@@ -315,6 +347,8 @@ TWILIO_AUTH = os.getenv("TWILIO_AUTH")
 TWILIO_FROM = os.getenv("TWILIO_FROM")
 TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
 TWILIO_USE_WHATSAPP = envbool("TWILIO_USE_WHATSAPP", "False")
+WHATSAPP_DOWN_CONTENT_SID = os.getenv("WHATSAPP_DOWN_CONTENT_SID")
+WHATSAPP_UP_CONTENT_SID = os.getenv("WHATSAPP_UP_CONTENT_SID")
 
 # Trello
 TRELLO_APP_KEY = os.getenv("TRELLO_APP_KEY")

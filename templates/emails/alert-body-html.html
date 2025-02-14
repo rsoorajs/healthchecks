@@ -2,7 +2,11 @@
 {% load hc_extras humanize %}
 
 <p>
-    "{{ check.name_then_code }}" is {{ check.status|upper }}.
+    {% if flip.new_status == "down" %}
+    "{{ check.name_then_code }}" is DOWN{% if flip.reason %} ({{ flip.reason_long }}){% endif %}.
+    {% else %}
+    "{{ check.name_then_code }}" is UP.
+    {% endif %}
     <a href="{{ check.cloaked_url }}">View on {% site_name %}&hellip;</a>
 </p>
 
@@ -43,7 +47,7 @@
         {{ trtr|safe }} {% cycle trtr %}
         {% endif %}
 
-        {% if check.kind == "cron" %}
+        {% if check.kind == "cron" or check.kind == "oncalendar" %}
         <td style="padding-right: 32px; padding-bottom: 8px; vertical-align: top;">
             <b>Schedule</b><br>
             <code>{{ check.schedule }}</code>
@@ -58,7 +62,7 @@
 
         <td style="padding-right: 32px; padding-bottom: 8px; vertical-align: top;">
             <b>Total Pings</b><br>
-            {{ check.n_pings }}
+            {% if ping %}{{ ping.n }}{% else %}0{% endif %}
             {% if check.created %}(since {{ check.created|date:'M j, Y' }}){% endif %}
         </td>
     </tr>
@@ -103,9 +107,20 @@
         </td>
     </tr>
     {% endif %}
+
+    <tr>
+        <td style="padding-right: 32px; padding-bottom: 8px; vertical-align: top;">
+            <b>Status Changed to {{ flip.new_status|title }} at</b><br>
+            {{ flip.created|date:"Y-m-d H:i:s T" }}
+        </td>
+    </tr>
 </table>
 
 {% if ping and ping.has_body %}
+{% if subject %}
+<p><b>Last Ping Subject</b><br>{{ subject }}</p>
+{% endif %}
+
 <p><b>Last Ping Body</b></p>
 {% if body is None %}
 <p>
@@ -139,14 +154,11 @@
 </table>
 {% endif %}
 
-<p style="color: #666666">
+<br>
+<p style="color: #666666; font-size: 90%">
 &mdash;<br>
-{% site_name %}<br>
-<a href="{{ unsub_link }}" target="_blank" style="color: #666666; text-decoration: underline;">
-    {% if check.project.name %}
-    Unsubscribe from "{{ check.project.name }}" notifications
-    {% else %}
-    Unsubscribe
-    {% endif %}
-</a>
+You are receiving this email because you are subscribed to {% site_name %} monitoring
+notifications{% if check.project.name %} for project "{{ check.project.name }}"{% endif %}.<br>
+Don't want to receive these notifications?
+<a href="{{ unsub_link }}" target="_blank" style="color: #666666; text-decoration: underline;">Unsubscribe</a>.
 </p>

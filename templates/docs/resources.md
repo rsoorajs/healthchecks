@@ -4,37 +4,29 @@ A collection of third-party software projects that integrate with SITE_NAME.
 Please submit additions and corrections
 [on GitHub](https://github.com/healthchecks/healthchecks/issues).
 
+## Command Runners, Shell Wrappers
+
+* [runitor](https://github.com/bdd/runitor) - A command runner with Healthchecks.io integration to keep your scripts and containers simple.
+* [crontask.sh](https://github.com/pforret/crontask) – Bash wrapper to use in crontab. Supports pinging.
+* [task-mon](https://github.com/dimo414/task-mon) – A small binary for notifying Healthchecks.io when a command runs, written in Rust.
+* [hc-monitor](https://gist.github.com/odolbeau/bd6d8eb7910d1289e2687682c8db9275) – Bash wrapper, supports pinging.
+
 ## Tools for Self-Hosting
 
 * [linuxserver/docker-healthchecks](https://github.com/linuxserver/docker-healthchecks) – Alternative Docker image
 * [galexrt/docker-healthchecks](https://github.com/galexrt/docker-healthchecks) – Alternative Docker image
-* [iphoting/healthchecks](https://github.com/iphoting/healthchecks/) – Deploy Healthchecks to Heroku
-* [ansible-collections/community.healthchecksio](https://github.com/ansible-collections/community.healthchecksio) - Ansible modules for automating tasks on Healthchecks.io
-
-## Command Runners, Shell Wrappers
-
-* [runitor](https://github.com/bdd/runitor) - A command runner with Healthchecks.io integration to keep your scripts and containers simple.
-* [SmartCronHelper](https://gitlab.science.ru.nl/bram/sch) – A cron shell wrapper. Automatically registers and pings cron jobs listed in crontab.
-* [crontask.sh](https://github.com/pforret/crontask) – Bash wrapper to use in crontab. Supports pinging.
-* [task-mon](https://github.com/dimo414/task-mon) – A small binary for notifying Healthchecks.io when a command runs, written in Rust.
+* [Elestio](https://elest.io/open-source/healthchecks) – Managed hosting platform with Healthchecks support (uses the linuxserver image)
 
 ## API Wrappers
+
+### Ansible
+
+* [ansible-collections/community.healthchecksio](https://github.com/ansible-collections/community.healthchecksio) - Ansible modules for automating tasks on Healthchecks.io
 
 ### Go
 
 * [kristofferahl/go-healthchecksio](https://github.com/kristofferahl/go-healthchecksio) – Supports listing, creating, updating, deleting, pausing, pinging.
-* [frozzare/go-healthchecks](https://github.com/frozzare/go-healthchecks) – Supports pinging and failing.
-
-### Javascript
-
-* [pauldenver/healthchecks-io-client](https://github.com/pauldenver/healthchecks-io-client) – Supports listing, creating, updating, deleting, pausing and pinging checks. Supports listing integrations.
-* [jwulf/healthchecks.io](https://github.com/jwulf/healthchecks.io) – Supports pinging.
-
-### PHP
-
-* [henrywhitaker3/PHP-healthchecks.io](https://github.com/henrywhitaker3/PHP-healthchecks.io) –  Supports listing, creating, updating, deleting, pausing, pinging, failing and starting checks. Supports listing integrations.
-* [prgTW/healthchecks-bundle](https://github.com/prgTW/healthchecks-bundle) – Symfony bundle. Supports listing, creating, pinging, pausing.
-* [janiscaunecm/Healthchecks_Magento](https://github.com/janiscaunecm/Healthchecks_Magento) – Magento module for Healthchecks.io.
+* [gitlab.com/etke.cc/go/healthchecks](https://gitlab.com/etke.cc/go/healthchecks) – Supports pinging.
 
 ### PowerShell
 
@@ -43,10 +35,8 @@ Please submit additions and corrections
 ### Python
 
 * [samarpan-rai/healthchecks_wrapper](https://github.com/samarpan-rai/healthchecks_wrapper) – Python context manager, supports pinging.
-
-### Ruby
-
-* [gyde-tv/checks](https://github.com/gyde-tv/checks) – Supports pinging.
+* [danidelvalle/healthchecks-decorator](https://github.com/danidelvalle/healthchecks-decorator) – Python context manager, supports pinging.
+* [andrewthetechie/py-healthchecks.io](https://github.com/andrewthetechie/py-healthchecks.io) – Supports creating, pinging. Has sync and async implementations.
 
 ### Rust
 
@@ -58,6 +48,7 @@ Please submit additions and corrections
 
 ## Backup Software Integrations
 
+* [backrest](https://github.com/garethgeorge/backrest) – A web UI and orchestrator for restic, includes Healthchecks.io support.
 * [binarybucks/restic-tools](https://github.com/binarybucks/restic-tools) – Wrapper around restic backup, with Healthchecks.io support.
 * [borgmatic](https://torsion.org/borgmatic/docs/how-to/monitor-your-backups/#healthchecks-hook) – A frontend to Borg, includes Healthchecks.io support.
 * [emborg](https://emborg.readthedocs.io/en/latest/monitoring.html#healthchecks-io) – A frontend to Borg, includes Healthchecks.io support.
@@ -65,5 +56,4 @@ Please submit additions and corrections
 ## Dashboards
 
 * [healthchecks/dashboard](https://github.com/healthchecks/dashboard) – A standalone HTML page showing the status of the checks in your account.
-* [HealthTray](https://github.com/taylus/HealthTray) – Watch your healthchecks in Windows system tray.
 * [nicoandrade/healthchecks-front](https://github.com/nicoandrade/healthchecks-front) – Beautiful & free web dashboard, works great on desktop and mobile.

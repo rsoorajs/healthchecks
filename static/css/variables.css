@@ -40,7 +40,7 @@
     --label-start-color: #117a3f;
     --link-color: #0091EA;
     --link-hover-color: #00629e;
-    --log-missing-bg: #fff3f2;
+    --log-flip-bg: #eee;
     --modal-content-bg: #fff;
     --nav-link-hover-bg: #eee;
     --panel-bg: #fff;
@@ -75,6 +75,8 @@
     --text-muted:  #767676;
     --text-success: #3c763d;
     --text-danger: #a94442;
+    --log-new-row-bg: #d9edf7;
+    --log-new-row-border: #bce8f1;
 }
 
 
@@ -120,7 +122,7 @@ body.dark {
     --label-start-color: #e0e0e2;
     --link-color: hsl(202.8, 100%, 55%);
     --link-hover-color: hsl(202.8, 100%, 65%);
-    --log-missing-bg: #2d1e21;
+    --log-flip-bg: #383840;
     --modal-content-bg: #1f1f22;
     --nav-link-hover-bg: #383840;
     --panel-bg: hsl(240, 6%, 16%);
@@ -155,4 +157,6 @@ body.dark {
     --text-muted: hsl(240, 3%, 55%);
     --text-success: #22bc66;
     --text-danger: #d9534f;
+    --log-new-row-bg: #123051;
+    --log-new-row-border: #163c64;
 }

@@ -2,6 +2,13 @@
 {% load compress humanize static hc_extras %}
 
 {% block title %}{{ check|down_title }}{% endblock %}
+{% block favicon %}
+    {% if check.status == "down" %}
+    <link rel="icon" type="image/svg+xml" href="{% static 'img/favicon_down.svg' %}">
+    {% else %}
+    <link rel="icon" type="image/svg+xml" href="{% static 'img/favicon.svg' %}">
+    {% endif %}
+{% endblock %}
 
 
 {% block content %}
@@ -169,9 +176,14 @@
                     <td>
                         <span class="value">{{ check.schedule }}</span>
                     </td>
+                    {% elif check.kind == "oncalendar" %}
+                    <th>OnCalendar Expr.</th>
+                    <td>
+                        <span class="value">{{ check.schedule|linebreaksbr }}</span>
+                    </td>
                     {% endif %}
                 </tr>
-                {% if check.kind == "cron" %}
+                {% if check.kind == "cron" or check.kind == "oncalendar" %}
                 <tr>
                     <th>Time Zone</th>
                     <td>
@@ -207,9 +219,27 @@
         </div>
 
         <div class="details-block">
+            {% if group_channels %}
+            <h2>Notification Groups</h2>
+            <table class="details-integrations table {% if rw %}rw{% endif %}">
+                {% for channel in group_channels %}
+                    <tr data-url="{% url 'hc-switch-channel' check.code channel.code %}" {% if channel in enabled_channels %}class="on"{% endif %}>
+                        <th>
+                            <span class="label">
+                                {% if channel in enabled_channels %}ON{% else %}OFF{% endif %}
+                            </span>
+                        </th>
+                        <td>
+                            <span class="ic-{{ channel.kind }}"></span>
+                            {{ channel }}
+                        </td>
+                    </tr>
+                {% endfor %}
+            </table>
+            {% endif %}
             <h2>Notification Methods</h2>
             {% if channels %}
-            <table id="details-integrations" class="table {% if rw %}rw{% endif %}">
+            <table class="details-integrations table {% if rw %}rw{% endif %}">
             {% for channel in channels %}
                 <tr data-url="{% url 'hc-switch-channel' check.code channel.code %}" {% if channel in enabled_channels %}class="on"{% endif %}>
                     <th>
@@ -281,7 +311,7 @@
                 </label>
                 {% endif %}
 
-                {% if check.kind == "cron" %}
+                {% if check.kind == "cron" or check.kind == "oncalendar" %}
                 <label
                     class="btn btn-default btn-xs active"
                     data-format="{{ check.tz }}">
@@ -291,7 +321,7 @@
                 {% endif %}
 
                 <label
-                    class="btn btn-default btn-xs {% if check.kind != 'cron' %}active{% endif %}"
+                    class="btn btn-default btn-xs {% if check.kind == 'simple' %}active{% endif %}"
                     data-format="local">
                     <input type="radio" name="date-format">
                     Browser's time zone
@@ -356,7 +386,8 @@
 {% endblock %}
 
 {% block scripts %}
-<script id="all-timezones" type="data">UTC,{{ timezones|join:"," }}</script>
+<script id="common-timezones" type="data">{{ common_timezones|join:"," }}</script>
+<script id="all-timezones" type="data">{{ timezones|join:"," }}</script>
 {% compress js %}
 <script src="{% static 'js/selectize.min.js' %}"></script>
 <script src="{% static 'js/nouislider.min.js' %}"></script>
@@ -364,11 +395,11 @@
 <script src="{% static 'js/moment.min.js' %}"></script>
 <script src="{% static 'js/moment-timezone-with-data-10-year-range.min.js' %}"></script>
 <script src="{% static 'js/purify.min.js' %}"></script>
+<script src="{% static 'js/initialize-timezone-selects.js' %}"></script>
 <script src="{% static 'js/update-timeout-modal.js' %}"></script>
 <script src="{% static 'js/adaptive-setinterval.js' %}"></script>
 <script src="{% static 'js/ping_details.js' %}"></script>
 <script src="{% static 'js/details.js' %}"></script>
-<script src="{% static 'js/initialize-timezone-selects.js' %}"></script>
 <script src="{% static 'js/slug-suggestions.js' %}"></script>
 {% endcompress %}
 {% endblock %}

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% load compress hc_extras static %}
 
-{% block title %}Sign In - {{ site_name }}{% endblock %}
+{% block title %}Log In - {{ site_name }}{% endblock %}
 
 {% block description %}{% endblock %}
 
@@ -12,8 +12,16 @@
 {% block content %}
 <div class="row">
     <div class="col-xs-10 col-xs-offset-1 col-sm-12 col-sm-offset-0 col-lg-8 col-lg-offset-2">
+        {% if account_closed %}
+        <div class="alert alert-info">
+            <p>
+                <strong>Account closed.</strong>
+                Your account has been closed and its associated data has been deleted.
+            </p>
+        </div>
+        {% endif %}
 
-        <h1>Sign In to {{ site_name }}</h1>
+        <h1>Log In to {{ site_name }}</h1>
         {% if bad_link %}
         <div class="alert alert-warning">
             <p>The login link you just used is either incorrect or expired.</p>
@@ -22,6 +30,7 @@
         {% endif %}
 
         <div class="row">
+            {% if use_magic_form %}
             <div class="col-sm-6">
                 <form id="magic-link-form" method="post">
                     {% csrf_token %}
@@ -43,7 +52,7 @@
                         autocomplete="email">
 
                     <p id="link-instruction">
-                        We will email you a magic sign in link.
+                        We will email you a magic log in link.
                     </p>
 
                     <button type="submit" class="btn btn-lg btn-primary btn-block">
@@ -58,8 +67,9 @@
                     <div>or</div>
                 </div>
             </div>
+            {% endif %}
 
-            <div class="col-sm-6">
+            <div class="col-sm-6{% if not use_magic_form %} col-sm-offset-3{% endif %}">
                 <form id="login-form" method="post">
                     {% csrf_token %}
                     <input type="hidden" name="action" value="login" />
@@ -94,7 +104,7 @@
                     </p>
 
                     <button type="submit" class="btn btn-lg btn-primary btn-block">
-                        Sign In
+                        Log In
                     </button>
                 </form>
             </div>
@@ -118,7 +128,7 @@
                     If you need to reset your password, please do the following:
                 </p>
                 <ol>
-                    <li>Sign in using the <strong>Email Me a Link</strong> method.</li>
+                    <li>Log in using the <strong>Email Me a Link</strong> method.</li>
                     <li>
                         Once in your account, go to
                         <strong>Account Settings › Set Password</strong>

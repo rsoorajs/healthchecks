@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta as td
 
 from django.utils.timezone import now
 
@@ -9,7 +10,7 @@ from hc.test import BaseTestCase
 
 
 class FlipModelTestCase(BaseTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         self.check = Check.objects.create(project=self.project)
         self.channel = Channel.objects.create(project=self.project, kind="email")
@@ -20,27 +21,47 @@ class FlipModelTestCase(BaseTestCase):
         self.flip.old_status = "up"
         self.flip.new_status = "down"
 
-    def test_select_channels_works(self):
+    def test_select_channels_works(self) -> None:
         channels = self.flip.select_channels()
         self.assertEqual(channels, [self.channel])
 
-    def test_select_channels_handles_noop(self):
-        self.channel.value = json.dumps({"down": False})
+    def test_select_channels_handles_noop(self) -> None:
+        self.channel.value = json.dumps(
+            {"value": "alice@example.org", "up": False, "down": False}
+        )
         self.channel.save()
 
         channels = self.flip.select_channels()
         self.assertEqual(channels, [])
 
-    def test_send_alerts_handles_new_up_transition(self):
+    def test_select_channels_validates_new_status(self) -> None:
+        self.flip.new_status = "paused"
+        with self.assertRaises(NotImplementedError):
+            self.flip.select_channels()
+
+    def test_send_alerts_handles_new_up_transition(self) -> None:
         self.flip.old_status = "new"
         self.flip.new_status = "up"
 
         channels = self.flip.select_channels()
         self.assertEqual(channels, [])
 
-    def test_it_skips_disabled_channels(self):
+    def test_it_skips_disabled_channels(self) -> None:
         self.channel.disabled = True
         self.channel.save()
 
         channels = self.flip.select_channels()
         self.assertEqual(channels, [])
+
+    def test_it_sorts_channels_by_last_notify_duration(self) -> None:
+        c1 = Channel.objects.create(
+            project=self.project, kind="email", last_notify_duration=td(seconds=1)
+        )
+        c1.checks.add(self.check)
+        c9 = Channel.objects.create(
+            project=self.project, kind="email", last_notify_duration=td(seconds=9)
+        )
+        c9.checks.add(self.check)
+
+        channels = self.flip.select_channels()
+        self.assertEqual(channels, [c1, c9, self.channel])

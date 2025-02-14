@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta as td
+from typing import Any
 
 from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand
@@ -21,7 +22,7 @@ class Command(BaseCommand):
 
     """
 
-    def handle(self, *args, **options):
+    def handle(self, **options: Any) -> str:
         month_ago = now() - td(days=30)
 
         # Old accounts, never logged in, no team memberships
@@ -34,12 +35,12 @@ class Command(BaseCommand):
         self.stdout.write("Pruned %d never-logged-in user accounts." % count)
 
         # Profiles scheduled for deletion
-        q = Profile.objects.order_by("id")
-        q = q.filter(deletion_notice_date__lt=month_ago)
+        pq = Profile.objects.order_by("id")
+        pq = pq.filter(deletion_notice_date__lt=month_ago)
         # Exclude users who have logged in after receiving deletion notice
-        q = q.exclude(user__last_login__gt=F("deletion_notice_date"))
+        pq = pq.exclude(user__last_login__gt=F("deletion_notice_date"))
 
-        for profile in q:
+        for profile in pq:
             self.stdout.write("Deleting inactive %s" % profile.user.email)
             profile.user.delete()
 
